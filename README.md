@@ -5,7 +5,7 @@ Linux node. Give it a **full Pod UID** and it discovers the Pod's containers,
 child processes, and sandbox process through cgroup v2. It writes an ELF core
 file for each collected process and a JSON manifest describing the result.
 
-Version **0.2.1** is a native Rust tool derived from the `corex` implementation in
+PodDump is a native Rust tool derived from the `corex` implementation in
 [Microsoft ProcDump for Linux 3.5.3](https://github.com/microsoft/ProcDump-Linux/tree/8e34cbfaf57b38ca6b73160031e360edcbe6b9c1).
 It performs discovery, scheduling, memory capture, and ELF writing itself; it
 does not launch a ProcDump subprocess for each PID.
@@ -77,7 +77,7 @@ time is not part of the controlled performance comparison.
 ```text
 $ sudo poddump --pod 278e2ad6-fa13-4b1e-8e94-24899d0e6622 --output ./case_001
 
-PodDump 0.2.1
+PodDump
 Node: localhost.localdomain  |  Scope: readable  |  Durability: batch
 
 Pod: 278e2ad6-fa13-4b1e-8e94-24899d0e6622
@@ -181,13 +181,10 @@ files are unvalidated artifacts, not complete attributed evidence.
   for every language runtime. See the GDB note in
   [architecture and limits](docs/architecture.md).
 
-Version 0.2.1 changes CLI presentation and option aliases. The performance
-measurements below were acquired with version 0.2.0.
-
 ## Performance and validation
 
 The 48 complete comparison runs tested six workload shapes, two repeats, tuned
-ProcDump PID workers, the previous PodDump 0.1.3, PodDump 0.2.0, and a
+ProcDump PID workers, earlier baseline PodDump, PodDump, and a
 no-collection control. Both collectors captured the same Pod process sets
 with the matched `legacy32` mapping policy and a global 4-target limit.
 Timing includes final file and directory synchronization. One additional
@@ -195,7 +192,7 @@ attempt had an incomplete load-generator record and is retained separately;
 a control-file publication fix preceded its replacement, with the collector
 binary and measurement settings unchanged (49 attempts in total).
 
-| Workload | ProcDump PID (s) | PodDump 0.1.3 (s) | PodDump 0.2.0 (s) | Paired speedup |
+| Workload | ProcDump PID (s) | Baseline PodDump (s) | PodDump (s) | Paired speedup |
 | --- | ---: | ---: | ---: | ---: |
 | 1 Pod × 32 containers / 8 MiB resident bulk per app process | 1.297 | 0.687 | 0.508 | 2.61× (2.27–2.95) |
 | 8 Pods × 16 containers / 8 MiB resident bulk per app process | 4.139 | 4.589 | 3.637 | 1.13× (1.06–1.20) |
@@ -205,18 +202,18 @@ binary and measurement settings unchanged (49 attempts in total).
 | 8 Pods × 8 containers / nginx+Redis | 5.437 | 3.293 | 6.843 | 0.79× (0.54–1.04) |
 
 Times are two-repeat medians; speedup is the median of same-block
-ProcDump/PodDump 0.2.0 ratios. The range contains both observed ratios.
+ProcDump/PodDump ratios. The range contains both observed ratios.
 This is a single 8-vCPU/12-GiB VMware node, not a claim about every cluster.
 MiB labels describe the seeded resident bulk; other fixture mappings,
 stacks, libraries, child processes and sandbox processes are also included.
 One Pod with 32 containers was 2.27–2.95× faster than ProcDump and
-1.26–1.49× faster than 0.1.3. At 64 Pods, 0.2.0 lost to ProcDump in both
-repeats; nginx/Redis also regressed against 0.1.3 in both repeats.
+1.26–1.49× faster than the earlier baseline. At 64 Pods, PodDump lost to ProcDump in both
+repeats; nginx/Redis also regressed against the baseline in both repeats.
 Synthetic output sizes matched exactly. Dynamic service mappings differed
-slightly; the second optimized service run was 0.85% larger than 0.1.3.
+slightly; the second optimized service run was 0.85% larger than the earlier baseline.
 See [benchmark methods, per-repeat results and costs](docs/benchmarks.md)
 for workload details, PSI, CPU, context switches, request latency and limits.
-The 0.2.0 candidate also passed 20 offline unit tests and eight controlled
+The collector candidate also passed 20 offline unit tests and eight controlled
 persistence/cancellation interventions. 
 
 ## Repository layout
@@ -232,7 +229,7 @@ licenses/procdump_mit.txt Original upstream MIT license
 NOTICE.txt               Upstream attribution and modifications
 ```
 
-The embedded provenance describes the current CLI build. The measured 0.2.0
+The embedded provenance describes the current CLI build. The measured benchmark
 record is preserved in benchmarks/build_provenance_v0_2_0.json. Repository
 documentation and packaging updates do not replace that measured build record.
 
