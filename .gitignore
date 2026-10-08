@@ -1,0 +1,11 @@
+/target/
+/artifacts/
+/dumps/
+/cases/
+*.core
+*.partial
+__pycache__/
+*.py[cod]
+.env
+/.idea/
+/.vscode/

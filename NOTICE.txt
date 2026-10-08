@@ -1,0 +1,23 @@
+PodDump 0.2.1
+
+The corex ELF notes, process-map parsing and ELF layout originate from
+Microsoft ProcDump for Linux 3.5.3, commit
+8e34cbfaf57b38ca6b73160031e360edcbe6b9c1.
+Original source: https://github.com/microsoft/ProcDump-Linux
+The original Microsoft MIT license is preserved in licenses/procdump_mit.txt.
+The repository LICENSE also covers KKudroK contributions under MIT terms.
+
+Modifications include Pod/cgroup/identity discovery, bounded scheduling and
+memory admission, seizure/interrupt and cleanup behavior, strict memory reads,
+XSAVE notes, corrected PRSTATUS genealogy, bounded direct anonymous snapshots,
+sparse writing, timeout/cancellation, manifests and error reporting.
+
+Rust dependencies are pinned in Cargo.lock. Their own license files are
+preserved with the vendored sources. This derivative is not an official
+Microsoft product and does not imply Microsoft endorsement.
+
+Version 0.2.0 adds bounded deferred durability, retained original write file
+descriptions, data-writeback overlap, and explicit final directory persistence.
+
+Version 0.2.1 adds hierarchical terminal output, JSON compatibility, full-ID
+display, and the --pod alias. Memory acquisition and durability logic are unchanged.
