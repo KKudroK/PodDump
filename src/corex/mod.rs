@@ -170,8 +170,20 @@ pub(crate) fn capture(
                 "selected": m.should_dump,
                 "is_shared": m.is_shared,
                 "is_file_backed": m.is_file_backed,
-                "reason": if m.should_dump { "attempt_all_mapped_proc_mem" } else { "uncommitted_anonymous_prot_none" },
-                "actual_reader": if m.should_dump { "pinned_proc_mem" } else { "skipped_uncommitted" }
+                "reason": if m.should_dump {
+                    "attempt_all_mapped_proc_mem"
+                } else if procfs::is_kernel_special_unreadable(&m.path) {
+                    "kernel_special_unreadable"
+                } else {
+                    "uncommitted_anonymous_prot_none"
+                },
+                "actual_reader": if m.should_dump {
+                    "pinned_proc_mem"
+                } else if procfs::is_kernel_special_unreadable(&m.path) {
+                    "skipped_kernel_special"
+                } else {
+                    "skipped_uncommitted"
+                }
             }));
         }
         let registers_begin_ns = crate::now();

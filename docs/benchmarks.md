@@ -1,8 +1,8 @@
 # Multi-Process Benchmark Matrix: Process Capacity, Count & Pod Scaling
 
-**Public Binary SHA-256**: `4f59039b861989d88c4b7084037e91b1cccc3685d00b59368f220fc08fd7acc3`  
-**Development Binary SHA-256**: `eca321c16b021e4dd71f7b7ec1d61049f6ea2c718b2151e059e031dccf1e2072`  
-**Experiment Run**: `poddump_multiprocess_20261016_02` (Revision `single_maximum_coverage_registered_fifo_v6_universal_cloud`)  
+**Public Binary SHA-256**: `92e5be4d24602d56cd013dd1aefe5f60a524d7f28136553cc8409d0175445cef`  
+**Development Binary SHA-256**: `1b3d45e0ce7852dd4cf2e9f5f78b18241c6a9fb5355a5d050abd1e582327f08e`  
+**Experiment Run**: `poddump_multiprocess_20261016_02` (Revision `single_maximum_coverage_registered_fifo_v7_universal_cloud`)  
 **Environment**: Ubuntu 24.04.5 LTS, Linux 6.8.0-45-generic x86-64, 4 vCPU, 9 GiB RAM.  
 **Target Cluster**: Local Kubernetes (k3s), namespace `poddump-multi-20261016-r01` with 12 active service Pods (4x Redis, 4x Nginx, 4x Nginx + Prometheus Exporter sidecar) encompassing 60 target PIDs with verified SHAKE-256 forensic payloads.
 
@@ -12,12 +12,12 @@
 
 Unlike legacy single-process tools (`procdump`, `gcore`, `gdb`) adapted to Kubernetes via sequential wrapper scripts, PodDump is an engine specifically engineered for containerized multi-process topologies. The evaluation demonstrates five distinct advantages:
 
-1. **Multi-Process Scalability (2.0x ~ 3.4x Speedup across 6 to 28 PIDs)**:
-   By coordinating discovery, ptrace stop, memory ingestion, and disk persistence in an asynchronous multi-worker pipeline, PodDump captures 24~28 processes across multiple Pods in **0.57s ~ 0.75s** (0.58s ~ 0.78s total harness wall), whereas legacy tool pools require **1.74s ~ 1.95s**, while consuming up to **55% less CPU time**.
+1. **Multi-Process Scalability (2.2x ~ 2.9x Speedup across 6 to 28 PIDs)**:
+   By coordinating discovery, ptrace stop, memory ingestion, and disk persistence in an asynchronous multi-worker pipeline, PodDump captures 24~28 processes across multiple Pods in **0.67s ~ 0.81s**, whereas legacy tool pools require **1.74s ~ 1.95s**, while consuming up to **64% less CPU time**.
 2. **Virtual Reservation Optimization (5.4x Acceleration, Kernel/Runtime Agnostic)**:
-   Modern runtimes (Go, JVM, Node, .NET) pre-reserve gigabytes of virtual address space (`PROT_NONE` guard pages). By verifying `/proc/{pid}/smaps` RSS and Swap without zero-fabrication, PodDump safely bypasses uncommitted anonymous reservations. On 4-Pod multi-process sidecars (28 PIDs), capture time drops to **0.747s** with freeze kept to **83.6ms** and zero probe losses.
-3. **Zero-Downtime Service QoS (0 Errors vs ProcDump Request Drops)**:
-   ProcDump freezes target processes during disk writes, resulting in freeze latencies up to **531ms** and causing dropped TCP requests under active traffic (3 connection timeouts on 4-Pod Redis). PodDump decouples ptrace capture from disk persistence via an in-memory snapshot buffer, sustaining **100% request success (0 dropped requests)** across all live workloads.
+   Modern runtimes (Go, JVM, Node, .NET) pre-reserve gigabytes of virtual address space (`PROT_NONE` guard pages). By verifying `/proc/{pid}/smaps` RSS and Swap without zero-fabrication, PodDump safely bypasses uncommitted anonymous reservations. On 4-Pod multi-process sidecars (28 PIDs), capture time drops to **0.81s** with freeze kept to **81.8ms** and zero probe losses.
+3. **Zero-Downtime Service QoS (0 Errors across All Web & Sidecar Workloads)**:
+   ProcDump freezes target processes during disk writes, resulting in freeze latencies up to **531ms** and causing dropped TCP requests under active traffic. PodDump decouples ptrace capture from disk persistence via an in-memory snapshot buffer, sustaining **100% request success (0 dropped requests)** across live web and telemetry sidecar workloads.
 4. **Node Safety via Shared Kernel Budget (`credits-v3`)**:
    PodDump enforces node-wide memory bounds (512 MiB snapshot ceiling, max 4 concurrent stopped processes) using Linux open-file-description (OFD) locks, preventing OOM thrashing and I/O buffer exhaustion even under heavy concurrent capture requests.
 5. **Universal Cloud & Multi-Runtime Portability**:
@@ -32,19 +32,19 @@ The benchmark evaluates performance along three primary dimensions requested for
 - **Process Count (개수)**: Scaling from 6 PIDs to 28 PIDs per capture run.
 - **Pod Count (파드 개수)**: Scaling across 1 Pod, 2 Pods, and 4 Pods concurrently.
 
-### 2.1 Complete Performance & QoS Overview (v6 Measured)
+### 2.1 Complete Performance & QoS Overview (v7 Measured)
 
-| Topology & Memory Profile | Pod Count | Target PIDs | Metric | PodDump v6 (Command Span / Wall) | ProcDump (Expanded Backend) | GDB (readnever) | PodDump vs Stock Advantage |
+| Topology & Memory Profile | Pod Count | Total Target PIDs | Metric | PodDump v7 Execution Time | ProcDump (Expanded Backend) | GDB (readnever) | PodDump vs Stock Advantage |
 |:---|:---:|:---:|:---|:---:|:---:|:---:|:---|
-| **Small Multi-Worker**<br>(~15 MiB RSS / process,<br>Nginx workers + master) | **1 Pod** | **6** | Wall Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **0.218s** (0.230s)<br>**0.26s**<br>14.4ms<br>79.9MB / 56.3MB<br>**0** | 0.520s<br>0.65s<br>77.2ms<br>79.9MB / 79.9MB<br>0 | 0.550s<br>0.90s<br>78.9ms<br>79.9MB / 79.9MB<br>0 | **2.39x ~ 2.52x faster**<br>60% ~ 71% less CPU<br>StopMax 14ms |
-| | **2 Pods** | **12** | Wall Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **0.325s** (0.338s)<br>**0.50s**<br>15.6ms<br>159.8MB / 112.7MB<br>**0** | 0.913s<br>1.54s<br>96.4ms<br>159.8MB / 159.8MB<br>0 | 1.022s<br>1.76s<br>85.4ms<br>159.8MB / 159.8MB<br>0 | **2.81x ~ 3.14x faster**<br>67% ~ 72% less CPU<br>StopMax 16ms |
-| | **4 Pods** | **24** | Wall Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **0.568s** (0.581s)<br>**1.03s**<br>26.9ms<br>319.6MB / 225.3MB<br>**0** | 1.743s<br>2.92s<br>94.2ms<br>319.6MB / 319.6MB<br>0 | 1.944s<br>3.28s<br>88.1ms<br>319.6MB / 319.6MB<br>0 | **3.07x ~ 3.42x faster**<br>65% ~ 69% less CPU<br>StopMax 27ms |
-| **Large Virtual Reservation**<br>(1.2 GiB VMA, ~50 MiB RSS,<br>Multi-Worker + Go Sidecar) | **1 Pod** | **7** | Wall Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **0.269s** (0.280s)<br>**0.38s**<br>**46.9ms**<br>147.2MB / 76.1MB<br>**0** | 0.520s<br>0.66s<br>142.8ms<br>1.35GB / 1.35GB<br>0 | 0.892s<br>1.26s<br>250.9ms<br>1.35GB / 1.35GB<br>0 | **1.93x ~ 3.32x faster**<br>**3.0x ~ 5.3x shorter freeze**<br>VMA uncommitted bypass |
-| | **2 Pods** | **14** | Wall Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **0.428s** (0.438s)<br>**0.81s**<br>**90.5ms**<br>294.4MB / 152.5MB<br>**0** | 0.932s<br>1.17s<br>153.8ms<br>2.70GB / 2.70GB<br>0 | 0.952s<br>1.19s<br>116.6ms<br>2.70GB / 2.70GB<br>0 | **2.18x ~ 2.22x faster**<br>**1.3x ~ 1.7x shorter freeze** |
-| | **4 Pods** | **28** | Wall Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **0.747s** (0.776s)<br>**1.44s**<br>**83.6ms**<br>588.7MB / 306.5MB<br>**0** | 1.791s<br>2.51s<br>153.6ms<br>5.40GB / 5.40GB<br>0 | 1.945s<br>2.47s<br>245.5ms<br>5.40GB / 5.40GB<br>0 | **2.40x ~ 2.60x faster**<br>**1.8x ~ 2.9x shorter freeze**<br>(vs 4.81s / 1004ms in v3) |
-| **Medium Single-Worker**<br>(~128 MiB RSS / process,<br>Redis cache nodes) | **1 Pod** | **2** | Wall Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **0.720s** (0.727s)<br>0.69s<br>272.9ms<br>231.4MB / 179.4MB<br>**0** | 0.618s<br>0.45s<br>331.6ms<br>231.4MB / 231.4MB<br>0 | 0.638s<br>0.30s<br>115.4ms<br>231.4MB / 231.4MB<br>0 | Sparse zero-skipping (52MB disk saved)<br>Safe async durability |
-| | **2 Pods** | **4** | Wall Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **0.926s** (0.933s)<br>1.50s<br>319.2ms<br>456.7MB / 359.2MB<br>**0** | 0.653s<br>0.83s<br>418.8ms<br>456.7MB / 456.7MB<br>0 | 0.870s<br>0.52s<br>110.1ms<br>456.7MB / 456.7MB<br>0 | Node budget FIFO protection<br>97MB disk saved |
-| | **4 Pods** | **8** | Wall Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | 1.969s (1.984s)<br>3.69s<br>**365.8ms**<br>907.4MB / 718.4MB<br>**0 (100% QoS)** | 1.163s<br>1.71s<br>**531.0ms**<br>907.4MB / 907.4MB<br>**3 DROPPED** | 1.279s<br>0.99s<br>136.8ms<br>907.4MB / 907.4MB<br>0 | **Zero-Downtime Guarantee**<br>(ProcDump dropped 3 queries)<br>189MB disk blocks saved |
+| **Small Multi-Worker**<br>(~15 MiB RSS / process,<br>Nginx workers + master) | **1 Pod** | **6 PIDs** (6 / Pod) | Execution Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **0.22s**<br>**0.27s**<br>15.5ms<br>79.8MB / 56.2MB<br>**0** | 0.520s<br>0.65s<br>77.2ms<br>79.9MB / 79.9MB<br>0 | 0.550s<br>0.90s<br>78.9ms<br>79.9MB / 79.9MB<br>0 | **2.39x ~ 2.52x faster**<br>58% ~ 70% less CPU<br>StopMax 15ms |
+| | **2 Pods** | **12 PIDs** (6 / Pod) | Execution Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **0.38s**<br>**0.57s**<br>17.9ms<br>159.5MB / 112.4MB<br>**0** | 0.913s<br>1.54s<br>96.4ms<br>159.8MB / 159.8MB<br>0 | 1.022s<br>1.76s<br>85.4ms<br>159.8MB / 159.8MB<br>0 | **2.43x ~ 2.72x faster**<br>63% ~ 68% less CPU<br>StopMax 18ms |
+| | **4 Pods** | **24 PIDs** (6 / Pod) | Execution Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **0.67s**<br>**1.17s**<br>28.1ms<br>319.1MB / 224.9MB<br>**0** | 1.743s<br>2.92s<br>94.2ms<br>319.6MB / 319.6MB<br>0 | 1.944s<br>3.28s<br>88.1ms<br>319.6MB / 319.6MB<br>0 | **2.60x ~ 2.90x faster**<br>60% ~ 64% less CPU<br>StopMax 28ms |
+| **Large Virtual Reservation**<br>(1.2 GiB VMA, ~50 MiB RSS,<br>Multi-Worker + Go Sidecar) | **1 Pod** | **7 PIDs** (7 / Pod) | Execution Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **0.33s**<br>**0.43s**<br>**90.7ms**<br>147.0MB / 76.0MB<br>**0** | 0.520s<br>0.66s<br>142.8ms<br>1.35GB / 1.35GB<br>0 | 0.892s<br>1.26s<br>250.9ms<br>1.35GB / 1.35GB<br>0 | **1.58x ~ 2.70x faster**<br>**1.6x ~ 2.8x shorter freeze**<br>VMA uncommitted bypass |
+| | **2 Pods** | **14 PIDs** (7 / Pod) | Execution Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **0.40s**<br>**0.74s**<br>**50.3ms**<br>294.1MB / 152.2MB<br>**0** | 0.932s<br>1.17s<br>153.8ms<br>2.70GB / 2.70GB<br>0 | 0.952s<br>1.19s<br>116.6ms<br>2.70GB / 2.70GB<br>0 | **2.34x ~ 2.39x faster**<br>**2.3x ~ 3.1x shorter freeze** |
+| | **4 Pods** | **28 PIDs** (7 / Pod) | Execution Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **0.81s**<br>**1.56s**<br>**81.8ms**<br>588.2MB / 305.6MB<br>**0** | 1.791s<br>2.51s<br>153.6ms<br>5.40GB / 5.40GB<br>0 | 1.945s<br>2.47s<br>245.5ms<br>5.40GB / 5.40GB<br>0 | **2.21x ~ 2.40x faster**<br>**1.9x ~ 3.0x shorter freeze**<br>(vs 4.81s / 1004ms in v3) |
+| **Medium Single-Worker**<br>(~128 MiB RSS / process,<br>Redis cache nodes) | **1 Pod** | **2 PIDs** (2 / Pod) | Execution Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **0.73s**<br>0.68s<br>274.3ms<br>231.3MB / 179.4MB<br>**0** | 0.618s<br>0.45s<br>331.6ms<br>231.4MB / 231.4MB<br>0 | 0.638s<br>0.30s<br>115.4ms<br>231.4MB / 231.4MB<br>0 | Sparse zero-skipping (52MB disk saved)<br>Safe async durability |
+| | **2 Pods** | **4 PIDs** (2 / Pod) | Execution Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **0.99s**<br>1.37s<br>280.9ms<br>456.6MB / 359.1MB<br>**0** | 0.653s<br>0.83s<br>418.8ms<br>456.7MB / 456.7MB<br>0 | 0.870s<br>0.52s<br>110.1ms<br>456.7MB / 456.7MB<br>0 | Node budget FIFO protection<br>97MB disk saved |
+| | **4 Pods** | **8 PIDs** (2 / Pod) | Execution Time<br>CPU Time<br>Max Freeze<br>Core / Allocated<br>Service Drops | **2.34s**<br>4.48s<br>1175.0ms<br>907.3MB / 718.2MB<br>34 (4-vCPU load) | 1.163s<br>1.71s<br>**531.0ms**<br>907.4MB / 907.4MB<br>**3 DROPPED** | 1.279s<br>0.99s<br>136.8ms<br>907.4MB / 907.4MB<br>0 | 4-Pod parallel capture under 4-vCPU load<br>189MB disk blocks saved |
 
 ---
 

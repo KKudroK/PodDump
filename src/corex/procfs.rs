@@ -169,6 +169,7 @@ fn parse_mapping(line: &str) -> Option<Mapping> {
     if permissions.get(2) == Some(&b'x') {
         flags |= PF_X;
     }
+    let should_dump = !is_kernel_special_unreadable(&path);
     Some(Mapping {
         start,
         end,
@@ -176,9 +177,13 @@ fn parse_mapping(line: &str) -> Option<Mapping> {
         offset,
         is_shared: permissions.get(3) == Some(&b's'),
         is_file_backed: inode > 0,
-        should_dump: true,
+        should_dump,
         path,
     })
+}
+
+pub(super) fn is_kernel_special_unreadable(path: &str) -> bool {
+    matches!(path, "[vvar]" | "[vsyscall]") || path.starts_with("[vvar")
 }
 
 fn read_status(pid: i32) -> Result<(i32, i32, i32, u32, u32), CorexError> {
@@ -333,5 +338,17 @@ Swap:                  0 kB\n";
         assert!(mappings[1].should_dump);
         assert!(mappings[2].should_dump);
         assert!(mappings[3].should_dump);
+    }
+
+    #[test]
+    fn kernel_special_unreadable_mappings_are_not_selected_for_dump() {
+        let vvar = parse_mapping("7fff7fbfb000-7fff7fbfd000 r--p 00000000 00:00 0 [vvar]").unwrap();
+        assert!(!vvar.should_dump);
+        let vsyscall = parse_mapping("ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0 [vsyscall]").unwrap();
+        assert!(!vsyscall.should_dump);
+        let vdso = parse_mapping("7fff7fbfe000-7fff7fc00000 r-xp 00000000 00:00 0 [vdso]").unwrap();
+        assert!(vdso.should_dump);
+        let heap = parse_mapping("000055a123400000-000055a123421000 rw-p 00000000 00:00 0 [heap]").unwrap();
+        assert!(heap.should_dump);
     }
 }
