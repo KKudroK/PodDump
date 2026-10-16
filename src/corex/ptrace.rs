@@ -370,10 +370,14 @@ fn read_xstate(tid: i32) -> Result<Vec<u8>, CorexError> {
         )
     };
     if rc < 0 {
-        return Err(CorexError::Ptrace(format!(
-            "XSAVE TID {tid}: {}",
-            io::Error::last_os_error()
-        )));
+        let err = io::Error::last_os_error();
+        if matches!(
+            err.raw_os_error(),
+            Some(libc::ENODEV | libc::EOPNOTSUPP | libc::EINVAL | libc::EIO)
+        ) {
+            return Ok(Vec::new());
+        }
+        return Err(CorexError::Ptrace(format!("XSAVE TID {tid}: {err}")));
     }
     if iov.iov_len < 576 || iov.iov_len >= data.len() {
         return Err(CorexError::InvalidData(format!(

@@ -1,7 +1,6 @@
 use super::{CorexError, Mapping, ProcessInfo};
 use std::fs::{self, File};
 use std::io::Read;
-use std::os::unix::fs::FileExt;
 
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
@@ -53,35 +52,16 @@ pub(super) fn read_process(pid: i32) -> Result<ProcessInfo, CorexError> {
     })
 }
 
-pub(super) fn apply_coredump_filter(
-    process: &mut ProcessInfo,
-    memory: &File,
-) -> Result<(), CorexError> {
-    let executable = process.exe.clone();
-    for mapping in &mut process.mappings {
-        let category = match (mapping.is_file_backed, mapping.is_shared) {
-            (false, false) => 0,
-            (false, true) => 1,
-            (true, false) => 2,
-            (true, true) => 3,
-        };
-        mapping.should_dump = process.coredump_filter & (1 << category) != 0;
-        if mapping.should_dump
-            || mapping.flags & PF_W != 0
-            || (!executable.is_empty() && mapping.path == executable)
-        {
-            mapping.should_dump = true;
-            continue;
-        }
-        if process.coredump_filter & (1 << 4) != 0
-            && mapping.is_file_backed
-            && mapping.offset == 0
-            && has_elf_magic(memory, mapping.start)?
-        {
-            mapping.should_dump = true;
-        }
-    }
-    Ok(())
+const UNCOMMITTED_PROT_NONE_MIN_BYTES: u64 = 16 * 1024 * 1024;
+
+fn is_large_anon_prot_none(m: &Mapping) -> bool {
+    m.flags == 0
+        && !m.is_file_backed
+        && !matches!(
+            m.path.as_str(),
+            "[vvar]" | "[vdso]" | "[vsyscall]" | "[vectors]"
+        )
+        && m.end.saturating_sub(m.start) >= UNCOMMITTED_PROT_NONE_MIN_BYTES
 }
 
 fn read_maps(pid: i32) -> Result<Vec<Mapping>, CorexError> {
@@ -95,7 +75,60 @@ fn read_maps(pid: i32) -> Result<Vec<Mapping>, CorexError> {
                 .ok_or_else(|| CorexError::InvalidData(format!("invalid mapping line: {line}")))?,
         );
     }
+    if mappings.iter().any(is_large_anon_prot_none) {
+        if let Ok(smaps_contents) = fs::read_to_string(format!("/proc/{pid}/smaps")) {
+            filter_uncommitted_prot_none(&mut mappings, &smaps_contents);
+        }
+    }
     Ok(mappings)
+}
+
+fn filter_uncommitted_prot_none(mappings: &mut [Mapping], smaps: &str) {
+    let mut current_range: Option<(u64, u64)> = None;
+    let mut current_rss: Option<u64> = None;
+    let mut current_swap: Option<u64> = None;
+    let mut apply = |range: Option<(u64, u64)>, rss: Option<u64>, swap: Option<u64>| {
+        if let (Some((start, end)), Some(0), Some(0)) = (range, rss, swap) {
+            if let Some(m) = mappings
+                .iter_mut()
+                .find(|m| m.start == start && m.end == end && is_large_anon_prot_none(m))
+            {
+                m.should_dump = false;
+            }
+        }
+    };
+    for line in smaps.lines() {
+        if line.contains('-') && line.as_bytes().first().is_some_and(u8::is_ascii_hexdigit) {
+            if let Some((start_str, rest)) = line.split_once('-') {
+                if let Some((end_str, _)) = rest.split_once(' ') {
+                    if let (Ok(start), Ok(end)) = (
+                        u64::from_str_radix(start_str, 16),
+                        u64::from_str_radix(end_str, 16),
+                    ) {
+                        apply(current_range, current_rss, current_swap);
+                        current_range = Some((start, end));
+                        current_rss = None;
+                        current_swap = None;
+                        continue;
+                    }
+                }
+            }
+        }
+        if current_range.is_some() {
+            if let Some(rest) = line.strip_prefix("Rss:") {
+                current_rss = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok());
+            } else if let Some(rest) = line.strip_prefix("Swap:") {
+                current_swap = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok());
+            }
+        }
+    }
+    apply(current_range, current_rss, current_swap);
 }
 
 fn parse_mapping(line: &str) -> Option<Mapping> {
@@ -240,17 +273,6 @@ fn page_size() -> Result<u64, CorexError> {
     }
 }
 
-fn has_elf_magic(memory: &File, address: u64) -> Result<bool, CorexError> {
-    let mut magic = [0_u8; 4];
-    let n = memory
-        .read_at(&mut magic, address)
-        .map_err(|e| CorexError::io("read ELF magic", format!("{address:#x}"), e))?;
-    if n != 4 {
-        return Err(CorexError::InvalidData("short ELF magic read".into()));
-    }
-    Ok(magic == *b"\x7fELF")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +298,40 @@ mod tests {
         assert!(parse_mapping("1000-2000 rwqp 00000000 08:01 42 /tmp/x").is_none());
         assert!(parse_mapping("2000-1000 r--p 00000000 08:01 42 /tmp/x").is_none());
         assert!(parse_mapping("1000-1000 r--p 00000000 08:01 42 /tmp/x").is_none());
+    }
+
+    #[test]
+    fn uncommitted_large_prot_none_requires_zero_rss_and_zero_swap() {
+        let mut mappings = vec![
+            parse_mapping(
+                "000000c000000000-000000c004000000 ---p 00000000 00:00 0 [anon: Go: heap reservation]",
+            )
+            .unwrap(),
+            parse_mapping("000000c004000000-000000c008000000 ---p 00000000 00:00 0").unwrap(),
+            parse_mapping("000000c008000000-000000c00c000000 ---p 00000000 00:00 0").unwrap(),
+            parse_mapping("00007f0000000000-00007f0000001000 ---p 00000000 00:00 0").unwrap(),
+        ];
+        let smaps = "\
+000000c000000000-000000c004000000 ---p 00000000 00:00 0 [anon: Go: heap reservation]\n\
+Size:              65536 kB\n\
+Rss:                   0 kB\n\
+Swap:                  0 kB\n\
+000000c004000000-000000c008000000 ---p 00000000 00:00 0 \n\
+Size:              65536 kB\n\
+Rss:                   0 kB\n\
+Swap:                  4 kB\n\
+000000c008000000-000000c00c000000 ---p 00000000 00:00 0 \n\
+Size:              65536 kB\n\
+Rss:                   4 kB\n\
+Swap:                  0 kB\n\
+00007f0000000000-00007f0000001000 ---p 00000000 00:00 0 \n\
+Size:                  4 kB\n\
+Rss:                   0 kB\n\
+Swap:                  0 kB\n";
+        filter_uncommitted_prot_none(&mut mappings, smaps);
+        assert!(!mappings[0].should_dump);
+        assert!(mappings[1].should_dump);
+        assert!(mappings[2].should_dump);
+        assert!(mappings[3].should_dump);
     }
 }

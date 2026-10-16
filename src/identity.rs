@@ -26,42 +26,204 @@ pub fn valid_uid(uid: &str) -> Result<(), String> {
     }
     Ok(())
 }
-fn member(cgroup: &str, uid: &str) -> bool {
+fn is_pod_segment(segment: &str, uid: &str) -> bool {
     let normalized = uid.replace('-', "_");
-    cgroup
-        .split('/')
-        .any(|s| s == format!("pod{uid}") || s.ends_with(&format!("-pod{normalized}.slice")))
+    segment == format!("pod{uid}")
+        || segment == format!("pod{normalized}")
+        || segment.ends_with(&format!("-pod{normalized}.slice"))
+        || segment.ends_with(&format!("-pod{uid}.slice"))
 }
-pub fn resolve(uid: &str) -> Result<PathBuf, String> {
-    if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
-        return Err("only cgroup v2 is supported".into());
+
+fn member(cgroup: &str, uid: &str) -> bool {
+    cgroup.split('/').any(|s| is_pod_segment(s, uid))
+}
+
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn parse_container_segment(segment: &str) -> Option<&str> {
+    if segment.starts_with("crio-conmon-") {
+        return None;
     }
-    let mut todo = vec![PathBuf::from("/sys/fs/cgroup")];
-    let mut hits = Vec::new();
-    while let Some(p) = todo.pop() {
-        for e in fs::read_dir(&p).map_err(|e| e.to_string())? {
-            let e = e.map_err(|e| e.to_string())?;
-            if e.file_type().map_err(|e| e.to_string())?.is_dir() {
-                let path = e.path();
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name == format!("pod{uid}")
-                    || name.ends_with(&format!("-pod{}.slice", uid.replace('-', "_")))
-                {
-                    hits.push(path)
+    let core = segment.strip_suffix(".scope").unwrap_or(segment);
+    if is_hex64(core) {
+        return Some(core);
+    }
+    for prefix in [
+        "cri-containerd-",
+        "crio-",
+        "docker-",
+        "containerd-",
+        "libpod-",
+    ] {
+        if let Some(id) = core.strip_prefix(prefix) {
+            if is_hex64(id) {
+                return Some(id);
+            }
+        }
+    }
+    if let Some((_, tail)) = core.rsplit_once('-') {
+        if is_hex64(tail) {
+            return Some(tail);
+        }
+    }
+    None
+}
+
+fn extract_container_id(cgroup: &str, uid: &str) -> Result<String, String> {
+    let mut after_pod = false;
+    let mut found: Option<&str> = None;
+    for seg in cgroup.split('/').filter(|s| !s.is_empty()) {
+        if is_pod_segment(seg, uid) {
+            after_pod = true;
+            continue;
+        }
+        if after_pod {
+            if let Some(id) = parse_container_segment(seg) {
+                found = Some(id);
+            }
+        }
+    }
+    if let Some(id) = found {
+        return Ok(id.to_string());
+    }
+    // Fallback for custom hierarchies where the 64-hex container scope appears anywhere in path
+    if let Some(id) = cgroup
+        .split('/')
+        .filter_map(parse_container_segment)
+        .next_back()
+    {
+        return Ok(id.to_string());
+    }
+    Err(format!("ambiguous container attribution: {cgroup}"))
+}
+
+fn cgroup_search_roots() -> Vec<PathBuf> {
+    let mut bases = Vec::new();
+    if let Ok(custom) = std::env::var("PODDUMP_CGROUP_ROOT") {
+        if !custom.is_empty() {
+            bases.push(PathBuf::from(custom));
+        }
+    }
+    for candidate in ["/host/sys/fs/cgroup", "/sys/fs/cgroup"] {
+        let p = PathBuf::from(candidate);
+        if p.is_dir() && !bases.contains(&p) {
+            bases.push(p);
+        }
+    }
+    let mut roots = Vec::new();
+    for base in bases {
+        if base.join("cgroup.controllers").exists() {
+            roots.push(base);
+        } else {
+            for sub in ["pids", "systemd", "memory", "cpu", ""] {
+                let r = if sub.is_empty() {
+                    base.clone()
                 } else {
-                    todo.push(path)
+                    base.join(sub)
+                };
+                if r.is_dir() && !roots.contains(&r) {
+                    roots.push(r);
                 }
             }
         }
     }
-    if hits.len() != 1 {
-        return Err(format!(
-            "Pod UID cgroup matches: {}; expected exactly one",
-            hits.len()
-        ));
-    }
-    Ok(hits.remove(0))
+    roots
 }
+
+pub fn resolve(uid: &str) -> Result<PathBuf, String> {
+    let roots = cgroup_search_roots();
+    if roots.is_empty() {
+        return Err("no cgroup filesystem found under /sys/fs/cgroup or /host/sys/fs/cgroup".into());
+    }
+    // Exact conventional roots avoid walking every container for every UID.
+    // Fallback retains discovery for custom hierarchies; membership is always
+    // revalidated from /proc before and after stopping.
+    let normalized = uid.replace('-', "_");
+    for root in &roots {
+        let root_str = root.to_string_lossy();
+        let mut standard = Vec::new();
+        for qos in ["", "burstable", "besteffort"] {
+            let systemd = if qos.is_empty() {
+                format!("{root_str}/kubepods.slice/kubepods-pod{normalized}.slice")
+            } else {
+                format!(
+                    "{root_str}/kubepods.slice/kubepods-{qos}.slice/kubepods-{qos}-pod{normalized}.slice"
+                )
+            };
+            let cgroupfs = if qos.is_empty() {
+                format!("{root_str}/kubepods/pod{uid}")
+            } else {
+                format!("{root_str}/kubepods/{qos}/pod{uid}")
+            };
+            for path in [systemd, cgroupfs] {
+                let p = PathBuf::from(path);
+                if p.is_dir() {
+                    standard.push(p);
+                }
+            }
+        }
+        if standard.len() == 1 {
+            return Ok(standard.remove(0));
+        }
+        if standard.len() > 1 {
+            return Err("ambiguous standard Pod cgroup roots".into());
+        }
+    }
+    for root in &roots {
+        let mut todo = vec![root.clone()];
+        let mut hits = Vec::new();
+        while let Some(p) = todo.pop() {
+            let Ok(entries) = fs::read_dir(&p) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    let path = e.path();
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if is_pod_segment(&name, uid) {
+                        hits.push(path);
+                    } else {
+                        todo.push(path);
+                    }
+                }
+            }
+        }
+        if hits.len() == 1 {
+            return Ok(hits.remove(0));
+        }
+        if hits.len() > 1 {
+            return Err(format!(
+                "Pod UID cgroup matches: {}; expected exactly one",
+                hits.len()
+            ));
+        }
+    }
+    Err("Pod UID cgroup matches: 0; expected exactly one".into())
+}
+
+fn select_proc_cgroup(cg_contents: &str, uid: &str) -> Result<String, String> {
+    if let Some(unified) = cg_contents.lines().find_map(|l| l.strip_prefix("0::")) {
+        if member(unified, uid) {
+            return Ok(unified.to_string());
+        }
+    }
+    for line in cg_contents.lines() {
+        if let Some((_, rest)) = line.split_once(':') {
+            if let Some((_, path)) = rest.split_once(':') {
+                if member(path, uid) {
+                    return Ok(path.to_string());
+                }
+            }
+        }
+    }
+    if let Some(unified) = cg_contents.lines().find_map(|l| l.strip_prefix("0::")) {
+        return Ok(unified.to_string());
+    }
+    Err("no cgroup entry found".into())
+}
+
 impl Identity {
     pub fn read(pid: i32, uid: &str) -> Result<Self, String> {
         let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
@@ -77,26 +239,11 @@ impl Identity {
             .parse()
             .map_err(|_| "bad starttime")?;
         let cg = fs::read_to_string(format!("/proc/{pid}/cgroup")).map_err(|e| e.to_string())?;
-        let cgroup = cg
-            .lines()
-            .find_map(|l| l.strip_prefix("0::"))
-            .ok_or("no unified cgroup")?
-            .to_string();
+        let cgroup = select_proc_cgroup(&cg, uid)?;
         if !member(&cgroup, uid) {
             return Err(format!("PID {pid} no longer belongs to Pod {uid}"));
         }
-        let container_id = cgroup
-            .split('/')
-            .filter_map(|s| {
-                s.strip_prefix("cri-containerd-")
-                    .and_then(|s| s.strip_suffix(".scope"))
-                    .or_else(|| {
-                        (s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())).then_some(s)
-                    })
-            })
-            .last()
-            .ok_or_else(|| format!("ambiguous container attribution: {cgroup}"))?
-            .to_string();
+        let container_id = extract_container_id(&cgroup, uid)?;
         Ok(Self {
             pid,
             starttime,
@@ -164,6 +311,32 @@ mod tests {
         assert!(member(&format!("/kubepods/pod{uid}/container"), uid));
         assert!(!member(&format!("/kubepods/pod{uid}extra/container"), uid));
         assert!(!member(&format!("/prefixpod{uid}/container"), uid));
+    }
+    #[test]
+    fn supports_multi_runtime_and_cgroup_v1_v2_formats() {
+        let uid = "12345678-1234-1234-1234-123456789abc";
+        let norm = "12345678_1234_1234_1234_123456789abc";
+        let cid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        for path in [
+            format!("/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod{norm}.slice/cri-containerd-{cid}.scope"),
+            format!("/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod{norm}.slice/crio-{cid}.scope"),
+            format!("/kubepods.slice/kubepods-pod{norm}.slice/docker-{cid}.scope"),
+            format!("/kubepods/besteffort/pod{uid}/{cid}"),
+            format!("/kubepods/pod{uid}/crio-{cid}"),
+        ] {
+            assert!(member(&path, uid));
+            assert_eq!(extract_container_id(&path, uid).unwrap(), cid);
+        }
+        let conmon_path = format!(
+            "/kubepods.slice/kubepods-pod{norm}.slice/crio-conmon-{cid}.scope"
+        );
+        assert!(extract_container_id(&conmon_path, uid).is_err());
+
+        let cg_v1 = format!(
+            "11:pids:/kubepods/burstable/pod{uid}/{cid}\n1:name=systemd:/kubepods/burstable/pod{uid}/{cid}\n0::/\n"
+        );
+        let selected = select_proc_cgroup(&cg_v1, uid).unwrap();
+        assert_eq!(extract_container_id(&selected, uid).unwrap(), cid);
     }
     #[test]
     fn live_identity_negative_controls() {

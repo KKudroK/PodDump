@@ -10,3 +10,9 @@ __pycache__/
 .env
 /.idea/
 /.vscode/
+
+# Internal experiment outputs stay outside the distribution tree.
+/benchmarks/
+/docs/*_20[0-9][0-9]*
+/acceptance_record.json
+/ops_hardening_record_*.json
