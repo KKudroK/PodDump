@@ -95,27 +95,48 @@ pub(crate) fn capture(
 ) -> Result<Captured, CorexError> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let pid = id.pid;
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
-    if fd < 0 {
-        return Err(CorexError::io(
-            "pidfd_open",
-            pid.to_string(),
-            std::io::Error::last_os_error(),
-        ));
-    }
-    let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let check_alive = || {
-        let mut poll = libc::pollfd {
-            fd: pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut poll, 1, 0) };
-        if rc != 0 {
-            Err(CorexError::InvalidData(
-                "pidfd indicates exit or poll error".into(),
-            ))
+    let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
+    let pidfd: Option<OwnedFd> = if raw_fd >= 0 {
+        Some(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+    } else {
+        let err = std::io::Error::last_os_error();
+        let code = err.raw_os_error().unwrap_or(0);
+        if code == libc::ENOSYS || code == libc::EPERM {
+            None
         } else {
+            return Err(CorexError::io("pidfd_open", pid.to_string(), err));
+        }
+    };
+    let check_alive = || {
+        if let Some(ref fd) = pidfd {
+            let mut poll = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut poll, 1, 0) };
+            if rc != 0 {
+                Err(CorexError::InvalidData(
+                    "pidfd indicates exit or poll error".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        } else {
+            let rc = unsafe { libc::kill(pid, 0) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ESRCH) {
+                    return Err(CorexError::InvalidData(
+                        "process has exited (kill 0 returned ESRCH)".into(),
+                    ));
+                }
+            }
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                return Err(CorexError::InvalidData(
+                    "process procfs directory missing".into(),
+                ));
+            }
             Ok(())
         }
     };
@@ -192,12 +213,17 @@ pub(crate) fn capture(
         let mut thread_identities = Vec::new();
         for tid in attached.tids() {
             let stat_path = format!("/proc/{pid}/task/{tid}/stat");
-            let stat = std::fs::read_to_string(&stat_path)
+            let stat_raw = std::fs::read(&stat_path)
                 .map_err(|e| CorexError::io("read thread identity", stat_path, e))?;
-            let tail = stat
-                .rsplit_once(')')
-                .ok_or_else(|| CorexError::InvalidData("invalid thread stat".into()))?
-                .1;
+            let rparen = stat_raw
+                .iter()
+                .rposition(|&b| b == b')')
+                .ok_or_else(|| CorexError::InvalidData("invalid thread stat: missing closing parenthesis".into()))?;
+            let tail_bytes = stat_raw
+                .get(rparen + 1..)
+                .ok_or_else(|| CorexError::InvalidData("invalid thread stat: missing tail".into()))?;
+            let tail = std::str::from_utf8(tail_bytes)
+                .map_err(|_| CorexError::InvalidData("invalid thread stat encoding".into()))?;
             let starttime = tail
                 .split_whitespace()
                 .nth(19)

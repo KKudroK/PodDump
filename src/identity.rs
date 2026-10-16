@@ -224,21 +224,35 @@ fn select_proc_cgroup(cg_contents: &str, uid: &str) -> Result<String, String> {
     Err("no cgroup entry found".into())
 }
 
+pub(crate) fn parse_stat_fields(stat_raw: &[u8]) -> Result<(char, u64), String> {
+    let rparen = stat_raw
+        .iter()
+        .rposition(|&b| b == b')')
+        .ok_or("bad stat: missing closing parenthesis")?;
+    let tail_bytes = stat_raw
+        .get(rparen + 1..)
+        .ok_or("bad stat: missing tail after closing parenthesis")?;
+    let tail = std::str::from_utf8(tail_bytes).map_err(|_| "bad stat tail: non-ascii fields")?;
+    let fields: Vec<_> = tail.split_whitespace().collect();
+    let state = fields
+        .get(0)
+        .and_then(|s| s.chars().next())
+        .ok_or("empty state")?;
+    let starttime = fields
+        .get(19)
+        .ok_or("short stat")?
+        .parse()
+        .map_err(|_| "bad starttime")?;
+    Ok((state, starttime))
+}
+
 impl Identity {
     pub fn read(pid: i32, uid: &str) -> Result<Self, String> {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
+        let stat_raw = fs::read(format!("/proc/{pid}/stat"))
             .map_err(|e| format!("PID {pid} stat: {e}"))?;
-        let fields: Vec<_> = stat
-            .get(stat.rfind(')').ok_or("bad stat")? + 1..)
-            .ok_or("bad stat")?
-            .split_whitespace()
-            .collect();
-        let starttime = fields
-            .get(19)
-            .ok_or("short stat")?
-            .parse()
-            .map_err(|_| "bad starttime")?;
-        let cg = fs::read_to_string(format!("/proc/{pid}/cgroup")).map_err(|e| e.to_string())?;
+        let (state, starttime) = parse_stat_fields(&stat_raw)?;
+        let cg_raw = fs::read(format!("/proc/{pid}/cgroup")).map_err(|e| e.to_string())?;
+        let cg = String::from_utf8_lossy(&cg_raw);
         let cgroup = select_proc_cgroup(&cg, uid)?;
         if !member(&cgroup, uid) {
             return Err(format!("PID {pid} no longer belongs to Pod {uid}"));
@@ -249,7 +263,7 @@ impl Identity {
             starttime,
             cgroup,
             container_id,
-            state: fields[0].chars().next().ok_or("empty state")?,
+            state,
         })
     }
     pub fn verify(&self, uid: &str) -> Result<(), String> {
@@ -268,8 +282,8 @@ pub fn census(root: &Path, uid: &str) -> Result<(Vec<Identity>, Vec<serde_json::
     let mut ids = BTreeMap::new();
     let mut errors = Vec::new();
     while let Some(p) = todo.pop() {
-        let procs = match fs::read_to_string(p.join("cgroup.procs")) {
-            Ok(s) => s,
+        let procs = match fs::read(p.join("cgroup.procs")) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(e) => {
                 errors.push(serde_json::json!({"path":p,"error":e.to_string(),"kind":"cgroup_read_failure"}));
                 continue;
@@ -294,6 +308,15 @@ pub fn census(root: &Path, uid: &str) -> Result<(Vec<Identity>, Vec<serde_json::
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn handles_non_utf8_comm_in_stat() {
+        let mut raw_stat = b"12345 (".to_vec();
+        raw_stat.extend_from_slice(&[0xff, 0xfe, 0xfd, 0x80]); // invalid UTF-8 bytes in process name
+        raw_stat.extend_from_slice(b") S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987654 20");
+        let (state, starttime) = parse_stat_fields(&raw_stat).unwrap();
+        assert_eq!(state, 'S');
+        assert_eq!(starttime, 987654);
+    }
     #[test]
     fn rejects_ambiguous_uid() {
         for s in [

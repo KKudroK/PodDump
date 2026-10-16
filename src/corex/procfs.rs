@@ -66,8 +66,8 @@ fn is_large_anon_prot_none(m: &Mapping) -> bool {
 
 fn read_maps(pid: i32) -> Result<Vec<Mapping>, CorexError> {
     let path = format!("/proc/{pid}/maps");
-    let contents =
-        fs::read_to_string(&path).map_err(|source| CorexError::io("read", &path, source))?;
+    let raw = fs::read(&path).map_err(|source| CorexError::io("read", &path, source))?;
+    let contents = String::from_utf8_lossy(&raw);
     let mut mappings = Vec::new();
     for line in contents.split_terminator('\n') {
         mappings.push(
@@ -76,7 +76,8 @@ fn read_maps(pid: i32) -> Result<Vec<Mapping>, CorexError> {
         );
     }
     if mappings.iter().any(is_large_anon_prot_none) {
-        if let Ok(smaps_contents) = fs::read_to_string(format!("/proc/{pid}/smaps")) {
+        if let Ok(smaps_raw) = fs::read(format!("/proc/{pid}/smaps")) {
+            let smaps_contents = String::from_utf8_lossy(&smaps_raw);
             filter_uncommitted_prot_none(&mut mappings, &smaps_contents);
         }
     }
@@ -188,8 +189,8 @@ pub(super) fn is_kernel_special_unreadable(path: &str) -> bool {
 
 fn read_status(pid: i32) -> Result<(i32, i32, i32, u32, u32), CorexError> {
     let path = format!("/proc/{pid}/status");
-    let contents =
-        fs::read_to_string(&path).map_err(|source| CorexError::io("read", &path, source))?;
+    let raw = fs::read(&path).map_err(|source| CorexError::io("read", &path, source))?;
+    let contents = String::from_utf8_lossy(&raw);
     for key in ["PPid:", "Uid:", "Gid:", "NSpgid:", "NSsid:"] {
         if !contents.lines().any(|l| {
             l.starts_with(key)
@@ -232,11 +233,11 @@ fn parse_next<T: Default + std::str::FromStr>(fields: &mut dyn Iterator<Item = &
 }
 
 fn read_groups_from_stat(pid: i32) -> Option<(i32, i32)> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let fields: Vec<_> = stat
-        .get(stat.rfind(')')? + 1..)?
-        .split_whitespace()
-        .collect();
+    let stat_raw = fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let rparen = stat_raw.iter().rposition(|&b| b == b')')?;
+    let tail_bytes = stat_raw.get(rparen + 1..)?;
+    let tail = std::str::from_utf8(tail_bytes).ok()?;
+    let fields: Vec<_> = tail.split_whitespace().collect();
     Some((fields.get(2)?.parse().ok()?, fields.get(3)?.parse().ok()?))
 }
 
@@ -350,5 +351,16 @@ Swap:                  0 kB\n";
         assert!(vdso.should_dump);
         let heap = parse_mapping("000055a123400000-000055a123421000 rw-p 00000000 00:00 0 [heap]").unwrap();
         assert!(heap.should_dump);
+    }
+
+    #[test]
+    fn parses_mapping_with_non_utf8_path() {
+        let mut raw = b"ffff800080000000-ffff800080021000 r-xp 00000000 08:01 42 /usr/bin/test_".to_vec();
+        raw.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+        let line = String::from_utf8_lossy(&raw);
+        let mapping = parse_mapping(&line).unwrap();
+        assert_eq!(mapping.start, 0xffff800080000000);
+        assert_eq!(mapping.end, 0xffff800080021000);
+        assert!(mapping.path.contains("test_"));
     }
 }

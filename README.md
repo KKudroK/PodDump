@@ -25,18 +25,18 @@ Legacy single-process tools (`ProcDump`, `gcore`, `GDB`) wrapped in shell script
 ### 2. Virtual Reservation Optimization & Kernel Agnosticism
 - **5.4x Acceleration & 12x Freeze Reduction**: Cloud-native sidecars (Prometheus Exporters, Fluentbit, Envoy) allocate over 1.2 GiB of uncommitted anonymous `PROT_NONE` guard pages via Go/JVM runtimes. Legacy tools dump these blindly, freezing targets for seconds.
 - PodDump inspects `/proc/{pid}/smaps` to verify `Rss: 0 kB` and `Swap: 0 kB`, safely bypassing uncommitted reservations without fabricating zero data. For 4 Pods (28 PIDs), capture time drops to **0.75s** with target freeze suppressed to **83.6 ms**.
-- Works universally across Linux 4.x, 5.x, and 6.x kernels, supporting Go, JVM, V8/Node.js, .NET, and jemalloc allocators without relying on kernel-specific VMA naming.
+- Works across Linux 5.3+ (native `pidfd_open` race-free process tracking) and Linux 4.19+ (graceful fallback to procfs/kill liveness checks), supporting Go, JVM, V8/Node.js, .NET, and jemalloc allocators without relying on kernel-specific VMA naming.
 
-### 3. Zero-Downtime Service QoS
-- **Zero Request Drops (100% Availability)**: `ProcDump` holds processes frozen during disk writes and fsync, causing stop latencies up to **531 ms** and dropping live TCP connections under load (3 query timeouts recorded on Redis).
-- PodDump captures memory into a 512 MiB in-memory snapshot buffer and **immediately resumes the target** (freeze limited to 14 ms ~ 90 ms), persisting data asynchronously to ensure **zero request failures** on live production traffic.
+### 3. Minimized Service Downtime & Low Stop Latency
+- **Sub-100ms Target Freeze Under Typical Load**: `ProcDump` holds processes frozen during disk writes and fsync, causing stop latencies up to **531 ms** and dropping live TCP connections under load (3 query timeouts recorded on Redis).
+- PodDump captures memory into a 512 MiB in-memory snapshot buffer and **immediately resumes the target** (freeze limited to 14 ms ~ 90 ms in typical workloads), persisting data asynchronously to minimize service disruption (targets exceeding 512 MiB transition to streaming mode while stopped; under severe host CPU saturation, freeze latencies can extend).
 
 ### 4. Node Safety via Shared Kernel Budget (`credits-v3`)
 - Uses Linux Open File Description (OFD) range locks on `/run/poddump-<uid>/credits-v3` to enforce node-wide resource quotas across concurrent PodDump instances:
   - Max 4 concurrently stopped processes node-wide
   - Max 512 MiB total snapshot buffer
   - Max 1 GiB pending write backlog
-- Enforces strict FIFO admission, preventing memory acquisition from triggering node OOM Killer cascades or disk I/O starvation.
+- Enforces strict FIFO admission, mitigating the risk of node OOM Killer cascades and unconstrained disk I/O bursts.
 
 ### 5. Forensic Integrity & Sparse File Optimization
 - **Zero Data Fabrication**: Unlike GDB, which inserts fake 4 KiB zero pages when reading unreadable kernel structures (`[vsyscall]`), PodDump never fabricates data. Unreadable ranges are omitted from `PT_LOAD` and audited with exact byte addresses and errno in `manifest.json`.

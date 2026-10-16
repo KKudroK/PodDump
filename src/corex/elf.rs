@@ -63,7 +63,11 @@ pub(super) struct ReadGap {
 }
 #[derive(Default, Clone)]
 pub(super) struct Coverage {
+    pub total_mapped_bytes: u64,
     pub requested_bytes: u64,
+    pub excluded_bytes: u64,
+    pub excluded_uncommitted_prot_none_bytes: u64,
+    pub excluded_kernel_special_bytes: u64,
     pub captured_bytes: u64,
     pub failed_bytes: u64,
     pub zero_chunk_bytes: u64,
@@ -81,11 +85,58 @@ impl Coverage {
             .map_err(|e| CorexError::InvalidData(format!("reserve read-error ledger: {e}")))?;
         Ok(v)
     }
+    pub(super) fn init_from_process(&mut self, process: &ProcessInfo) {
+        let mut total = 0u64;
+        let mut requested = 0u64;
+        let mut excl_prot_none = 0u64;
+        let mut excl_kernel_special = 0u64;
+
+        for m in &process.mappings {
+            let bytes = m.end.saturating_sub(m.start);
+            total = total.saturating_add(bytes);
+            if m.should_dump {
+                requested = requested.saturating_add(bytes);
+            } else if super::procfs::is_kernel_special_unreadable(&m.path) {
+                excl_kernel_special = excl_kernel_special.saturating_add(bytes);
+            } else {
+                excl_prot_none = excl_prot_none.saturating_add(bytes);
+            }
+        }
+
+        self.total_mapped_bytes = total;
+        self.requested_bytes = requested;
+        self.excluded_bytes = total.saturating_sub(requested);
+        self.excluded_uncommitted_prot_none_bytes = excl_prot_none;
+        self.excluded_kernel_special_bytes = excl_kernel_special;
+    }
+    pub(super) fn unattempted_bytes(&self) -> u64 {
+        self.requested_bytes.saturating_sub(self.captured_bytes + self.failed_bytes)
+    }
     pub(super) fn complete(&self) -> bool {
-        self.failed_bytes == 0 && self.captured_bytes == self.requested_bytes
+        self.failed_bytes == 0
+            && self.captured_bytes == self.requested_bytes
+            && self.unattempted_bytes() == 0
     }
     pub(super) fn json(&self) -> serde_json::Value {
-        serde_json::json!({"policy":"all_mapped_proc_mem","complete":self.complete(),"requested_bytes":self.requested_bytes,"captured_bytes":self.captured_bytes,"failed_bytes":self.failed_bytes,"unattempted_bytes":self.requested_bytes.saturating_sub(self.captured_bytes+self.failed_bytes),"captured_zero_chunk_bytes":self.zero_chunk_bytes,"captured_runs":self.spans,"read_errors":self.gaps,"missing_representation":"missing bytes have no PT_LOAD coverage; file padding is not captured memory","zero_representation":"sparse holes within PT_LOAD describe successfully read zero bytes only","ledger_entry_limit_each":MAX_RUNS})
+        serde_json::json!({
+            "policy": "all_mapped_proc_mem",
+            "policy_filter": "uncommitted_anonymous_prot_none_and_kernel_special_excluded",
+            "complete": self.complete(),
+            "total_mapped_bytes": self.total_mapped_bytes,
+            "requested_bytes": self.requested_bytes,
+            "excluded_bytes": self.excluded_bytes,
+            "excluded_uncommitted_prot_none_bytes": self.excluded_uncommitted_prot_none_bytes,
+            "excluded_kernel_special_bytes": self.excluded_kernel_special_bytes,
+            "captured_bytes": self.captured_bytes,
+            "failed_bytes": self.failed_bytes,
+            "unattempted_bytes": self.unattempted_bytes(),
+            "captured_zero_chunk_bytes": self.zero_chunk_bytes,
+            "captured_runs": self.spans,
+            "read_errors": self.gaps,
+            "missing_representation": "missing bytes have no PT_LOAD coverage; file padding is not captured memory",
+            "zero_representation": "sparse holes within PT_LOAD describe successfully read zero bytes only",
+            "ledger_entry_limit_each": MAX_RUNS,
+        })
     }
     fn success(
         &mut self,
@@ -504,12 +555,7 @@ pub(super) fn snapshot_reserved(
         ));
     }
     s.len = len;
-    s.stats.coverage.requested_bytes = process
-        .mappings
-        .iter()
-        .filter(|m| m.should_dump)
-        .map(|m| m.end - m.start)
-        .sum();
+    s.stats.coverage.init_from_process(process);
     let data = unsafe { std::slice::from_raw_parts_mut(s.ptr, s.len) };
     data[l.note as usize..l.note as usize + notes.len()].copy_from_slice(notes);
     // Read directly into a bounded scratch slice of the reserved snapshot;
@@ -624,12 +670,7 @@ pub(super) fn write_reserved<W: Write + Seek>(
         Some(s) => s,
         None => IoStats::reserved()?,
     };
-    stats.coverage.requested_bytes = process
-        .mappings
-        .iter()
-        .filter(|m| m.should_dump)
-        .map(|m| m.end - m.start)
-        .sum();
+    stats.coverage.init_from_process(process);
     assert_eq!(buffer.len(), MEMORY_CHUNK_SIZE);
     let display = path.display().to_string();
     output
@@ -1093,5 +1134,65 @@ mod maximum_coverage_regressions {
         assert!(is_all_zero(
             &bytes[l.note as usize + b"note-bytes".len()..l.first as usize]
         ));
+    }
+
+    #[test]
+    fn coverage_accounting_records_total_and_excluded_breakdown() {
+        let mut process = tests::process();
+        let page = process.page_size;
+        process.mappings = vec![
+            Mapping {
+                start: 0x1000,
+                end: 0x1000 + page,
+                flags: 4,
+                offset: 0,
+                is_shared: false,
+                is_file_backed: false,
+                should_dump: true,
+                path: "[heap]".into(),
+            },
+            Mapping {
+                start: 0x2000,
+                end: 0x2000 + page * 4,
+                flags: 0,
+                offset: 0,
+                is_shared: false,
+                is_file_backed: false,
+                should_dump: false,
+                path: "".into(),
+            },
+            Mapping {
+                start: 0x7fff0000,
+                end: 0x7fff0000 + page * 2,
+                flags: 4,
+                offset: 0,
+                is_shared: false,
+                is_file_backed: false,
+                should_dump: false,
+                path: "[vvar]".into(),
+            },
+        ];
+        let mut coverage = Coverage::reserve().unwrap();
+        coverage.init_from_process(&process);
+        assert_eq!(coverage.total_mapped_bytes, 7 * page);
+        assert_eq!(coverage.requested_bytes, page);
+        assert_eq!(coverage.excluded_bytes, 6 * page);
+        assert_eq!(coverage.excluded_uncommitted_prot_none_bytes, 4 * page);
+        assert_eq!(coverage.excluded_kernel_special_bytes, 2 * page);
+        assert_eq!(
+            coverage.total_mapped_bytes,
+            coverage.requested_bytes + coverage.excluded_bytes
+        );
+        let j = coverage.json();
+        assert_eq!(j["policy"], "all_mapped_proc_mem");
+        assert_eq!(
+            j["policy_filter"],
+            "uncommitted_anonymous_prot_none_and_kernel_special_excluded"
+        );
+        assert_eq!(j["total_mapped_bytes"], 7 * page);
+        assert_eq!(j["requested_bytes"], page);
+        assert_eq!(j["excluded_bytes"], 6 * page);
+        assert_eq!(j["excluded_uncommitted_prot_none_bytes"], 4 * page);
+        assert_eq!(j["excluded_kernel_special_bytes"], 2 * page);
     }
 }

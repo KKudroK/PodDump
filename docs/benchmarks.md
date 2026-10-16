@@ -54,18 +54,19 @@ The benchmark evaluates performance along three primary dimensions requested for
 In containerized architectures, pods rarely run a single isolated process; web servers, proxies, and sidecars spawn multiple processes (e.g., master + 4 workers + pause sandbox).
 - When capturing **4 Pods of multi-worker web servers (24 target PIDs)**:
   - Stock `procdump` and `gcore` execute per-PID CLI wrappers that suffer from process creation overhead, redundant procfs discovery, and lock contention, completing in **1.74s** and **1.94s**.
-  - PodDump operates natively at the Pod level, using asynchronous reader worker threads (default 4) and shared ingestion queues to capture all 24 PIDs in **1.02s** (**1.9x faster**).
-  - PodDump consumed only **2.02s CPU time** compared to GDB's **3.28s CPU time** (38% CPU savings).
+  - PodDump operates natively at the Pod level, using asynchronous reader worker threads (default 4) and shared ingestion queues to capture all 24 PIDs in **0.67s** (**2.60x ~ 2.90x faster**).
+  - PodDump consumed only **1.17s CPU time** compared to GDB's **3.28s CPU time** (64% CPU savings).
 
 ### 3.2 Impact of Uncommitted Virtual Reservation Filtering
-Prior to revision `v4`, PodDump attempted byte-for-byte captures of all mapped ranges, including anonymous `PROT_NONE` mappings reserved by runtimes such as Go (which reserves 1.2 GiB virtual space per sidecar). Because total virtual space exceeded the 512 MiB memory buffer, PodDump was forced into streaming mode with the target stopped, causing total time on 4 Pods (28 PIDs) to reach 4.81s with 1004ms freezes and 4 dropped Prometheus metrics probes.
+Prior to the uncommitted virtual reservation optimization, PodDump attempted byte-for-byte captures of all mapped ranges, including anonymous `PROT_NONE` mappings reserved by runtimes such as Go (which reserves 1.2 GiB virtual space per sidecar). Because total virtual space exceeded the 512 MiB memory buffer, PodDump was forced into streaming mode with the target stopped, causing total time on 4 Pods (28 PIDs) to reach 4.81s with 1004ms freezes and 4 dropped Prometheus metrics probes.
 - **The Solution**: PodDump now consults `/proc/{pid}/smaps`. Anonymous mappings with `flags == 0` and `Rss: 0 kB` are identified as uncommitted address reservations and marked as skipped (`reason: uncommitted_anonymous_prot_none`), while any committed mappings (`Rss > 0`) are strictly preserved.
-- **The Result**: Total dump file volume was reduced from 5.33 GiB to 597 MiB. Wall clock time dropped from **4.813s to 0.883s (5.4x speedup)**. Stop freeze dropped from **1004ms to 47.2ms (21x reduction)**, and Prometheus metrics probe losses dropped to **0**.
+- **The Result**: Total dump file volume on 4 Pods was reduced from 5.40 GiB to 588.2 MiB (305.6 MiB allocated). Execution time dropped to **0.81s (2.2x ~ 2.4x faster)**, target freeze was suppressed to **81.8ms (12x reduction)**, and Prometheus metrics probe losses dropped to **0**.
 
-### 3.3 Zero-Downtime QoS under Heavy Live Traffic
-During forensic acquisition of high-throughput services (e.g., Redis serving 50 validated GETs/s):
-- `ProcDump` holds targets stopped during synchronous disk writes. At 4 Pods, target freeze reached **531.0ms**, breaching Redis client timeout thresholds and generating **3 dropped requests / connection errors**.
-- `PodDump` buffers target memory in RAM before immediately detaching ptrace and resuming the process. Disk write and fsync proceed asynchronously. Process stop latency was held to **230ms**, resulting in **zero dropped requests (100% QoS)**.
+### 3.3 Service QoS and Freeze Latency Under Heavy Live Traffic
+During forensic acquisition of high-throughput services (e.g., Redis serving validated live GETs):
+- `ProcDump` holds targets stopped during synchronous disk writes. At 1 to 2 Pods, target freeze reached **331ms ~ 419ms**. At 4 Pods, target freeze reached **531ms**, breaching Redis client timeout thresholds and generating **3 dropped requests / connection errors**.
+- `PodDump` buffers target memory in RAM before immediately detaching ptrace and resuming the process. Disk write and fsync proceed asynchronously. Under 1 to 2 Pods, process stop latency was held to **274ms ~ 281ms**, resulting in **zero dropped requests**.
+- *Workload Boundary Observation*: When scaling to 4 Redis Pods (8 PIDs) under complete 4-vCPU saturation, PodDump recorded a max stop latency of **1175ms** and **34 client timeouts**, demonstrating that under extreme host CPU starvation, asynchronous worker progression is constrained. This highlights the importance of shared node budgets (`credits-v3`) to regulate parallel admissions.
 
 ---
 
@@ -93,7 +94,7 @@ The following historical table records the prior run (`poddump_final_management_
 | nginx_sidecar2 | 2.573 | 1.003 | 1.167 |
 | nginx_sidecar4 | 4.813 | 1.733 | 2.157 |
 
-*(Note: In the historical run above, `nginx_sidecar4` took 4.813s because uncommitted Go runtime virtual reservations forced streaming mode. In the current `ce78c22b` release above, this condition completes in 0.883s with 47.2ms freeze).*
+*(Note: In the historical run above, `nginx_sidecar4` took 4.813s because uncommitted Go runtime virtual reservations forced streaming mode. In the current release, this condition completes in 0.81s with 81.8ms freeze).*
 
 
 ## Earlier b148 maximum-range observations
