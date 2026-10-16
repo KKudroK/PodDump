@@ -25,21 +25,28 @@ not continuous monitoring or a guarantee of capturing short-lived processes.
 
 ## Single maximum-coverage policy
 
-The public and development binaries attempt every VMA through a pinned
-`/proc/PID/mem` descriptor. PF_R, coredump_filter, DONTDUMP, file backing and
-shared/private status are not selection filters. PROT_NONE, write-only and
-kernel special mappings are attempted. Permissions remain unchanged in ELF flags.
-There is no `--scope` or `--reader` selector. The manifest uses schema 2 and the
-fixed `collection_policy: all_mapped_proc_mem` identifier.
+The public and development binaries attempt mapped VMAs through a pinned
+`/proc/PID/mem` descriptor under a single maximum-coverage policy. PF_R,
+coredump_filter, DONTDUMP, file backing and shared/private status are not
+selection filters. Committed PROT_NONE and write-only mappings are attempted.
+Permissions remain unchanged in ELF flags. To eliminate false-positive partial flags
+caused by unreadable kernel pages or unallocated virtual reservations, the policy
+safely excludes kernel-special regions (`[vvar]`, `[vsyscall]`) and uncommitted
+anonymous `PROT_NONE` reservations verified via `/proc/{pid}/smaps` (`Rss: 0`, `Swap: 0`).
+These excluded ranges are not requested from `/proc/PID/mem` but are tracked in the
+audit ledger under `excluded_kernel_special_bytes` and `excluded_uncommitted_prot_none_bytes`.
+There is no `--scope` or `--reader` selector. The manifest uses schema 2,
+`collection_policy: all_mapped_proc_mem`, and `policy_filter: uncommitted_anonymous_prot_none_and_kernel_special_excluded`.
 
 After a large read fails, the current page is retried and an actual failure or
 zero-length read is recorded with its address range and errno. Reading continues
 at the next page and later VMAs. Only successfully read runs get PT_LOAD entries;
 failed bytes never become a zero-filled load segment. File padding is unreferenced
 memory, while sparse holes within PT_LOAD represent bytes actually read as zero.
-The coverage ledger distinguishes requested, captured, failed and unattempted bytes.
-GDB may fall back to an executable/file mapping for absent bytes; that is not
-captured evidence. Use the ELF segment table and ledger to distinguish them.
+The coverage ledger distinguishes total mapped, requested, captured, failed,
+excluded and unattempted bytes. GDB may fall back to an executable/file mapping
+for absent bytes; that is not captured evidence. Use the ELF segment table and
+ledger to distinguish them.
 
 A bounded table for at most 65,533 successful runs is reserved before payload
 capture (about 3.7 MB logical space). Ledger entries are separately bounded and

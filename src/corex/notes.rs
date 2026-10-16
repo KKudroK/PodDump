@@ -144,14 +144,14 @@ fn file_note(process: &ProcessInfo) -> Result<Option<Vec<u8>>, CorexError> {
     let mappings: Vec<_> = process
         .mappings
         .iter()
-        .filter(|mapping| mapping.path.starts_with('/'))
+        .filter(|mapping| mapping.raw_path.starts_with(b"/"))
         .collect();
     if mappings.is_empty() {
         return Ok(None);
     }
     if !process.page_size.is_power_of_two()
         || mappings.iter().any(|m| {
-            m.start >= m.end || m.offset % process.page_size != 0 || m.path.as_bytes().contains(&0)
+            m.start >= m.end || m.offset % process.page_size != 0 || m.raw_path.contains(&0)
         })
     {
         return Err(CorexError::InvalidData("invalid file mapping note".into()));
@@ -160,7 +160,7 @@ fn file_note(process: &ProcessInfo) -> Result<Option<Vec<u8>>, CorexError> {
         .iter()
         .try_fold(0usize, |total, mapping| {
             mapping
-                .path
+                .raw_path
                 .len()
                 .checked_add(1)
                 .and_then(|size| total.checked_add(size))
@@ -182,7 +182,7 @@ fn file_note(process: &ProcessInfo) -> Result<Option<Vec<u8>>, CorexError> {
         descriptor.extend_from_slice(&(mapping.offset / process.page_size).to_ne_bytes());
     }
     for mapping in mappings {
-        descriptor.extend_from_slice(mapping.path.as_bytes());
+        descriptor.extend_from_slice(&mapping.raw_path);
         descriptor.push(0);
     }
     Ok(Some(descriptor))
@@ -262,6 +262,7 @@ mod tests {
                 is_file_backed: true,
                 should_dump: true,
                 path: "/tmp/worker".into(),
+                raw_path: b"/tmp/worker".to_vec(),
             }],
             auxv: vec![0; 16],
             coredump_filter: 0x33,
@@ -316,6 +317,40 @@ mod tests {
         assert_eq!(&descriptor[0..8], &1_u64.to_ne_bytes());
         assert_eq!(&descriptor[8..16], &process().page_size.to_ne_bytes());
         assert!(descriptor.ends_with(b"/tmp/worker\0"));
+    }
+
+    #[test]
+    fn file_note_preserves_distinct_non_utf8_raw_paths() {
+        let mut p = process();
+        p.mappings = vec![
+            Mapping {
+                start: 0x1000,
+                end: 0x2000,
+                flags: 5,
+                offset: 0,
+                is_shared: false,
+                is_file_backed: true,
+                should_dump: true,
+                path: "/tmp/\u{FFFD}.bin".into(),
+                raw_path: b"/tmp/\x80.bin".to_vec(),
+            },
+            Mapping {
+                start: 0x2000,
+                end: 0x3000,
+                flags: 5,
+                offset: 0,
+                is_shared: false,
+                is_file_backed: true,
+                should_dump: true,
+                path: "/tmp/\u{FFFD}.bin".into(),
+                raw_path: b"/tmp/\x81.bin".to_vec(),
+            },
+        ];
+        let descriptor = file_note(&p).unwrap().unwrap();
+        assert_eq!(&descriptor[0..8], &2_u64.to_ne_bytes());
+        // Header (16) + 2 mappings * 24 = 64 bytes
+        let filenames = &descriptor[64..];
+        assert_eq!(filenames, b"/tmp/\x80.bin\0/tmp/\x81.bin\0");
     }
 
     #[cfg(target_arch = "x86_64")]

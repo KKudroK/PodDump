@@ -67,12 +67,14 @@ fn is_large_anon_prot_none(m: &Mapping) -> bool {
 fn read_maps(pid: i32) -> Result<Vec<Mapping>, CorexError> {
     let path = format!("/proc/{pid}/maps");
     let raw = fs::read(&path).map_err(|source| CorexError::io("read", &path, source))?;
-    let contents = String::from_utf8_lossy(&raw);
     let mut mappings = Vec::new();
-    for line in contents.split_terminator('\n') {
+    for line in raw.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
         mappings.push(
             parse_mapping(line)
-                .ok_or_else(|| CorexError::InvalidData(format!("invalid mapping line: {line}")))?,
+                .ok_or_else(|| CorexError::InvalidData("invalid mapping line in proc maps".into()))?,
         );
     }
     if mappings.iter().any(is_large_anon_prot_none) {
@@ -132,22 +134,32 @@ fn filter_uncommitted_prot_none(mappings: &mut [Mapping], smaps: &str) {
     apply(current_range, current_rss, current_swap);
 }
 
-fn parse_mapping(line: &str) -> Option<Mapping> {
+fn parse_mapping(line: &[u8]) -> Option<Mapping> {
     let mut rest = line;
-    let mut fields = Vec::with_capacity(5);
+    let mut fields: Vec<&[u8]> = Vec::with_capacity(5);
     for _ in 0..5 {
-        rest = rest.trim_start_matches([' ', '\t']);
-        let end = rest.find([' ', '\t']).unwrap_or(rest.len());
+        while let Some((&b, tail)) = rest.split_first() {
+            if b == b' ' || b == b'\t' {
+                rest = tail;
+            } else {
+                break;
+            }
+        }
+        let end = rest
+            .iter()
+            .position(|&b| b == b' ' || b == b'\t')
+            .unwrap_or(rest.len());
         if end == 0 {
             return None;
         }
         fields.push(&rest[..end]);
         rest = &rest[end..];
     }
-    let mut range = fields[0].splitn(2, '-');
+    let range_str = std::str::from_utf8(fields[0]).ok()?;
+    let mut range = range_str.splitn(2, '-');
     let start = u64::from_str_radix(range.next()?, 16).ok()?;
     let end = u64::from_str_radix(range.next()?, 16).ok()?;
-    let permissions = fields[1].as_bytes();
+    let permissions = fields[1];
     if start >= end
         || permissions.len() != 4
         || !matches!(permissions[0], b'r' | b'-')
@@ -157,9 +169,19 @@ fn parse_mapping(line: &str) -> Option<Mapping> {
     {
         return None;
     }
-    let offset = u64::from_str_radix(fields[2], 16).ok()?;
-    let inode = fields[4].parse::<u64>().ok()?;
-    let path = rest.trim_start_matches([' ', '\t']).to_owned();
+    let offset_str = std::str::from_utf8(fields[2]).ok()?;
+    let offset = u64::from_str_radix(offset_str, 16).ok()?;
+    let inode_str = std::str::from_utf8(fields[4]).ok()?;
+    let inode = inode_str.parse::<u64>().ok()?;
+    while let Some((&b, tail)) = rest.split_first() {
+        if b == b' ' || b == b'\t' {
+            rest = tail;
+        } else {
+            break;
+        }
+    }
+    let raw_path = rest.to_vec();
+    let path = String::from_utf8_lossy(&raw_path).into_owned();
     let mut flags = 0;
     if permissions.first() == Some(&b'r') {
         flags |= PF_R;
@@ -180,6 +202,7 @@ fn parse_mapping(line: &str) -> Option<Mapping> {
         is_file_backed: inode > 0,
         should_dump,
         path,
+        raw_path,
     })
 }
 
@@ -286,7 +309,7 @@ mod tests {
     #[test]
     fn parses_proc_mapping() {
         let mapping = parse_mapping(
-            "ffff800080000000-ffff800080021000 r-xp 00000000 08:01 42 /usr/bin/test app",
+            b"ffff800080000000-ffff800080021000 r-xp 00000000 08:01 42 /usr/bin/test app",
         )
         .unwrap();
         assert_eq!(mapping.start, 0xffff800080000000);
@@ -295,27 +318,29 @@ mod tests {
         assert!(mapping.is_file_backed);
         assert!(!mapping.is_shared);
         assert_eq!(mapping.path, "/usr/bin/test app");
+        assert_eq!(mapping.raw_path, b"/usr/bin/test app");
     }
 
     #[test]
     fn mapping_paths_preserve_spacing_and_bad_permissions_fail() {
-        let mapping = parse_mapping("1000-2000 r--p 00000000 08:01 42    /tmp/a  b \r").unwrap();
+        let mapping = parse_mapping(b"1000-2000 r--p 00000000 08:01 42    /tmp/a  b \r").unwrap();
         assert_eq!(mapping.path, "/tmp/a  b \r");
-        assert!(parse_mapping("1000-2000 rwqp 00000000 08:01 42 /tmp/x").is_none());
-        assert!(parse_mapping("2000-1000 r--p 00000000 08:01 42 /tmp/x").is_none());
-        assert!(parse_mapping("1000-1000 r--p 00000000 08:01 42 /tmp/x").is_none());
+        assert_eq!(mapping.raw_path, b"/tmp/a  b \r");
+        assert!(parse_mapping(b"1000-2000 rwqp 00000000 08:01 42 /tmp/x").is_none());
+        assert!(parse_mapping(b"2000-1000 r--p 00000000 08:01 42 /tmp/x").is_none());
+        assert!(parse_mapping(b"1000-1000 r--p 00000000 08:01 42 /tmp/x").is_none());
     }
 
     #[test]
     fn uncommitted_large_prot_none_requires_zero_rss_and_zero_swap() {
         let mut mappings = vec![
             parse_mapping(
-                "000000c000000000-000000c004000000 ---p 00000000 00:00 0 [anon: Go: heap reservation]",
+                b"000000c000000000-000000c004000000 ---p 00000000 00:00 0 [anon: Go: heap reservation]",
             )
             .unwrap(),
-            parse_mapping("000000c004000000-000000c008000000 ---p 00000000 00:00 0").unwrap(),
-            parse_mapping("000000c008000000-000000c00c000000 ---p 00000000 00:00 0").unwrap(),
-            parse_mapping("00007f0000000000-00007f0000001000 ---p 00000000 00:00 0").unwrap(),
+            parse_mapping(b"000000c004000000-000000c008000000 ---p 00000000 00:00 0").unwrap(),
+            parse_mapping(b"000000c008000000-000000c00c000000 ---p 00000000 00:00 0").unwrap(),
+            parse_mapping(b"00007f0000000000-00007f0000001000 ---p 00000000 00:00 0").unwrap(),
         ];
         let smaps = "\
 000000c000000000-000000c004000000 ---p 00000000 00:00 0 [anon: Go: heap reservation]\n\
@@ -343,13 +368,13 @@ Swap:                  0 kB\n";
 
     #[test]
     fn kernel_special_unreadable_mappings_are_not_selected_for_dump() {
-        let vvar = parse_mapping("7fff7fbfb000-7fff7fbfd000 r--p 00000000 00:00 0 [vvar]").unwrap();
+        let vvar = parse_mapping(b"7fff7fbfb000-7fff7fbfd000 r--p 00000000 00:00 0 [vvar]").unwrap();
         assert!(!vvar.should_dump);
-        let vsyscall = parse_mapping("ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0 [vsyscall]").unwrap();
+        let vsyscall = parse_mapping(b"ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0 [vsyscall]").unwrap();
         assert!(!vsyscall.should_dump);
-        let vdso = parse_mapping("7fff7fbfe000-7fff7fc00000 r-xp 00000000 00:00 0 [vdso]").unwrap();
+        let vdso = parse_mapping(b"7fff7fbfe000-7fff7fc00000 r-xp 00000000 00:00 0 [vdso]").unwrap();
         assert!(vdso.should_dump);
-        let heap = parse_mapping("000055a123400000-000055a123421000 rw-p 00000000 00:00 0 [heap]").unwrap();
+        let heap = parse_mapping(b"000055a123400000-000055a123421000 rw-p 00000000 00:00 0 [heap]").unwrap();
         assert!(heap.should_dump);
     }
 
@@ -357,10 +382,10 @@ Swap:                  0 kB\n";
     fn parses_mapping_with_non_utf8_path() {
         let mut raw = b"ffff800080000000-ffff800080021000 r-xp 00000000 08:01 42 /usr/bin/test_".to_vec();
         raw.extend_from_slice(&[0xff, 0xfe, 0xfd]);
-        let line = String::from_utf8_lossy(&raw);
-        let mapping = parse_mapping(&line).unwrap();
+        let mapping = parse_mapping(&raw).unwrap();
         assert_eq!(mapping.start, 0xffff800080000000);
         assert_eq!(mapping.end, 0xffff800080021000);
         assert!(mapping.path.contains("test_"));
+        assert_eq!(mapping.raw_path, b"/usr/bin/test_\xff\xfe\xfd");
     }
 }

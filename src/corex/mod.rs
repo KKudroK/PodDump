@@ -17,6 +17,7 @@ pub(super) struct Mapping {
     pub is_file_backed: bool,
     pub should_dump: bool,
     pub path: String,
+    pub raw_path: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]

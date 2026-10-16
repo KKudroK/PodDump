@@ -19,12 +19,12 @@ Given a **single Pod UID** on a host node, PodDump autonomously resolves and cap
 Legacy single-process tools (`ProcDump`, `gcore`, `GDB`) wrapped in shell scripts suffer from severe service downtime, node-wide OOM risks, and multi-gigabyte virtual address space latency in containerized environments. PodDump eliminates these fundamental bottlenecks by design.
 
 ### 1. Multi-Process Scalability
-- **2.4x ~ 3.4x Faster Capture Completion**: Instead of sequential per-PID dump scripts, PodDump utilizes an internal pipeline of 4 parallel reader workers and 2 async disk writers, capturing 6 to 28 container processes in just **0.22s to 0.75s**.
+- **2.4x ~ 3.4x Faster Capture Completion**: Instead of sequential per-PID dump scripts, PodDump utilizes an internal pipeline of 4 parallel reader workers and 2 async disk writers, capturing 6 to 28 container processes in just **0.22s to 0.81s**.
 - **Up to 55% Lower CPU Overhead**: Eliminates redundant procfs rescanning and child process spawns, using less than half the CPU cycles consumed by GDB on multi-process pods.
 
 ### 2. Virtual Reservation Optimization & Kernel Agnosticism
 - **5.4x Acceleration & 12x Freeze Reduction**: Cloud-native sidecars (Prometheus Exporters, Fluentbit, Envoy) allocate over 1.2 GiB of uncommitted anonymous `PROT_NONE` guard pages via Go/JVM runtimes. Legacy tools dump these blindly, freezing targets for seconds.
-- PodDump inspects `/proc/{pid}/smaps` to verify `Rss: 0 kB` and `Swap: 0 kB`, safely bypassing uncommitted reservations without fabricating zero data. For 4 Pods (28 PIDs), capture time drops to **0.75s** with target freeze suppressed to **83.6 ms**.
+- PodDump inspects `/proc/{pid}/smaps` to verify `Rss: 0 kB` and `Swap: 0 kB`, safely bypassing uncommitted reservations without fabricating zero data. For 4 Pods (28 PIDs), capture time drops to **0.81s** with target freeze suppressed to **81.8 ms**.
 - Works across Linux 5.3+ (native `pidfd_open` race-free process tracking) and Linux 4.19+ (graceful fallback to procfs/kill liveness checks), supporting Go, JVM, V8/Node.js, .NET, and jemalloc allocators without relying on kernel-specific VMA naming.
 
 ### 3. Minimized Service Downtime & Low Stop Latency
@@ -34,8 +34,8 @@ Legacy single-process tools (`ProcDump`, `gcore`, `GDB`) wrapped in shell script
 ### 4. Node Safety via Shared Kernel Budget (`credits-v3`)
 - Uses Linux Open File Description (OFD) range locks on `/run/poddump-<uid>/credits-v3` to enforce node-wide resource quotas across concurrent PodDump instances:
   - Max 4 concurrently stopped processes node-wide
-  - Max 512 MiB total snapshot buffer
-  - Max 1 GiB pending write backlog
+  - Max 512 MiB total snapshot buffer target
+  - Soft write backlog reservation (1 GiB nominal)
 - Enforces strict FIFO admission, mitigating the risk of node OOM Killer cascades and unconstrained disk I/O bursts.
 
 ### 5. Forensic Integrity & Sparse File Optimization
@@ -68,7 +68,7 @@ Engineered to run seamlessly across all major cloud providers (AWS EKS, GCP GKE,
 
 ## Measured Benchmark Results
 
-Evaluated on a Kubernetes node (Ubuntu 24.04.5 LTS, Linux 6.8, 4 vCPU, 9 GiB RAM) hosting 12 service Pods and 60 target processes under live traffic load (see [Detailed Benchmark Audit](docs/benchmarks.md)).
+Evaluated on a Kubernetes node (Ubuntu 24.04.5 LTS, Linux 6.8, 4 vCPU, 9 GiB RAM) hosting 12 service Pods and 60 target processes under live traffic load across 9 test conditions (generating 105 total cores; see [Detailed Benchmark Audit](docs/benchmarks.md)).
 
 ### 1. Acquisition Throughput & Speedup Matrix
 
@@ -309,8 +309,8 @@ PodDump coordinates concurrency across multiple invocations using `/run/poddump-
  [ FIFO Admission ] ──► Node-wide credits-v3 resource quota check
        │
        ├──► Concurrent Stops : Max 4 PIDs simultaneously attached via ptrace
-       ├──► Memory Buffer    : Max 512 MiB in-memory snapshot buffer
-       └──► I/O Backlog      : Max 1 GiB pending write queue
+       ├──► Memory Buffer    : 512 MiB target in-memory snapshot buffer
+       └──► I/O Backlog      : Soft 1 GiB pending write queue
        │
        ▼
  [ Parallel Reader ] ──► 4 worker threads streaming /proc/{pid}/mem

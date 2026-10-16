@@ -839,6 +839,7 @@ mod tests {
                 is_file_backed: false,
                 should_dump: true,
                 path: String::new(),
+                raw_path: Vec::new(),
             }],
             auxv: vec![],
             coredump_filter: 0x32,
@@ -1071,6 +1072,7 @@ mod maximum_coverage_regressions {
                 is_file_backed: i == 3,
                 should_dump: true,
                 path: format!("region_{i}"),
+                raw_path: format!("region_{i}").into_bytes(),
             });
         }
         let memory = File::open("/proc/self/mem").unwrap();
@@ -1150,6 +1152,7 @@ mod maximum_coverage_regressions {
                 is_file_backed: false,
                 should_dump: true,
                 path: "[heap]".into(),
+                raw_path: b"[heap]".to_vec(),
             },
             Mapping {
                 start: 0x2000,
@@ -1160,6 +1163,7 @@ mod maximum_coverage_regressions {
                 is_file_backed: false,
                 should_dump: false,
                 path: "".into(),
+                raw_path: Vec::new(),
             },
             Mapping {
                 start: 0x7fff0000,
@@ -1170,6 +1174,7 @@ mod maximum_coverage_regressions {
                 is_file_backed: false,
                 should_dump: false,
                 path: "[vvar]".into(),
+                raw_path: b"[vvar]".to_vec(),
             },
         ];
         let mut coverage = Coverage::reserve().unwrap();

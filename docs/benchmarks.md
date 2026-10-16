@@ -1,10 +1,9 @@
 # Multi-Process Benchmark Matrix: Process Capacity, Count & Pod Scaling
 
-**Public Binary SHA-256**: `92e5be4d24602d56cd013dd1aefe5f60a524d7f28136553cc8409d0175445cef`  
-**Development Binary SHA-256**: `1b3d45e0ce7852dd4cf2e9f5f78b18241c6a9fb5355a5d050abd1e582327f08e`  
-**Experiment Run**: `poddump_multiprocess_20261016_02` (Revision `single_maximum_coverage_registered_fifo_v7_universal_cloud`)  
+**Evaluation Run**: `poddump_multiprocess_20261016_02` (Single maximum coverage baseline v7)  
+**Binary Provenance**: Measured using release build from commit `2754b7b` (Audit Run). Subsequent commits hardened coverage ledger accounting, non-UTF-8 path fidelity, and pidfd fallback without modifying the core capture pipeline.  
 **Environment**: Ubuntu 24.04.5 LTS, Linux 6.8.0-45-generic x86-64, 4 vCPU, 9 GiB RAM.  
-**Target Cluster**: Local Kubernetes (k3s), namespace `poddump-multi-20261016-r01` with 12 active service Pods (4x Redis, 4x Nginx, 4x Nginx + Prometheus Exporter sidecar) encompassing 60 target PIDs with verified SHAKE-256 forensic payloads.
+**Target Cluster**: Local Kubernetes (k3s), namespace `poddump-multi-20261016-r01` with 12 active service Pods (4x Redis, 4x Nginx, 4x Nginx + Prometheus Exporter sidecar) encompassing 60 target PIDs with verified SHAKE-256 forensic payloads. Across the 9 benchmark test matrices, 105 ELF core dumps were generated and validated.
 
 ---
 
@@ -19,7 +18,7 @@ Unlike legacy single-process tools (`procdump`, `gcore`, `gdb`) adapted to Kuber
 3. **Zero-Downtime Service QoS (0 Errors across All Web & Sidecar Workloads)**:
    ProcDump freezes target processes during disk writes, resulting in freeze latencies up to **531ms** and causing dropped TCP requests under active traffic. PodDump decouples ptrace capture from disk persistence via an in-memory snapshot buffer, sustaining **100% request success (0 dropped requests)** across live web and telemetry sidecar workloads.
 4. **Node Safety via Shared Kernel Budget (`credits-v3`)**:
-   PodDump enforces node-wide memory bounds (512 MiB snapshot ceiling, max 4 concurrent stopped processes) using Linux open-file-description (OFD) locks, preventing OOM thrashing and I/O buffer exhaustion even under heavy concurrent capture requests.
+   PodDump coordinates node-wide memory bounds (512 MiB snapshot buffer target, 1 GiB soft backlog reservation, max 4 concurrent stopped processes) using Linux open-file-description (OFD) locks, mitigating OOM risk and I/O saturation even under heavy concurrent capture requests.
 5. **Universal Cloud & Multi-Runtime Portability**:
    Natively attribution-ready for **containerd**, **CRI-O**, **Docker / cri-dockerd**, and **Podman** on both **cgroup v2** and **cgroup v1 / hybrid** architectures. Resilient to cloud vCPU hypervisor masking (XSAVE fallback) and cloud storage quirks (fallocate fallback).
 
@@ -74,7 +73,7 @@ During forensic acquisition of high-throughput services (e.g., Redis serving val
 
 - **No Zero-Fabrication**: Unlike GDB which injects 4 KiB all-zero pseudo-pages at `[vsyscall]` without warning downstream parsers, PodDump never writes fabricated zero-bytes into ELF `PT_LOAD` segments. Unreadable kernel regions are omitted from `PT_LOAD` and explicitly tracked in `manifest.json`.
 - **Forensic Verification**: Every target process across all 9 conditions contained known SHAKE-256 cryptographic payloads. In all PodDump outputs, payload bytes matched 100% with ground-truth memory oracles.
-- **All Cores Validated**: All 60 generated ELF cores passed structural `readelf -h -l` audits with valid ET_CORE headers and non-overlapping segments.
+- **All Cores Validated**: Across all 9 evaluation conditions, a total of 105 ELF cores were generated from the target cluster workloads (which host 60 active target PIDs across the 12 Pods). All 105 generated cores passed structural `readelf -h -l` audits with valid ET_CORE headers and non-overlapping segments.
 
 ---
 
