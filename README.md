@@ -8,39 +8,34 @@
 
 ---
 
-**PodDump** is a **high-performance, non-disruptive memory forensics acquisition engine** engineered specifically for Kubernetes container and pod architectures.
+**PodDump** is a process memory acquisition tool designed for Kubernetes Pod environments.
 
-Given a **single Pod UID** on a host node, PodDump autonomously resolves and captures all processes across all containers within the Pod (applications, sidecars, and sandbox infrastructure) into standard ELF core files using precision ptrace control and an asynchronous multi-worker streaming pipeline.
+Given a **single Pod UID** on a host node, PodDump identifies all processes across containers within the Pod (applications, sidecars, and sandbox infrastructure) and captures process memory into standard ELF core files using ptrace control and an asynchronous streaming pipeline.
 
 ---
 
-## Why PodDump? (Key Merits over Legacy Tools)
+## Key Features
 
-Legacy single-process tools (`ProcDump`, `gcore`, `GDB`) wrapped in shell scripts suffer from severe service downtime, node-wide OOM risks, and multi-gigabyte virtual address space latency in containerized environments. PodDump eliminates these fundamental bottlenecks by design.
+Designed to minimize target freeze latency and collect multi-process Pod workloads reliably compared to sequential dump scripts.
 
 ### 1. Multi-Process Scalability
-- **2.4x ~ 3.4x Faster Capture Completion**: Instead of sequential per-PID dump scripts, PodDump utilizes an internal pipeline of 4 parallel reader workers and 2 async disk writers, capturing 6 to 28 container processes in just **0.22s to 0.81s**.
-- **Up to 55% Lower CPU Overhead**: Eliminates redundant procfs rescanning and child process spawns, using less than half the CPU cycles consumed by GDB on multi-process pods.
+- **Fast Capture:** Captures 6 to 28 container processes in **0.22s to 0.81s** using an asynchronous streaming pipeline.
+- **Lower CPU Overhead:** Eliminates redundant procfs rescanning and child process spawns, reducing CPU usage compared to GDB.
 
-### 2. Virtual Reservation Optimization & Kernel Agnosticism
-- **5.4x Acceleration & 12x Freeze Reduction**: Cloud-native sidecars (Prometheus Exporters, Fluentbit, Envoy) allocate over 1.2 GiB of uncommitted anonymous `PROT_NONE` guard pages via Go/JVM runtimes. Legacy tools dump these blindly, freezing targets for seconds.
-- PodDump inspects `/proc/{pid}/smaps` to verify `Rss: 0 kB` and `Swap: 0 kB`, safely bypassing uncommitted reservations without fabricating zero data. For 4 Pods (28 PIDs), capture time drops to **0.81s** with target freeze suppressed to **81.8 ms**.
-- Works across Linux 5.3+ (native `pidfd_open` race-free process tracking) and Linux 4.19+ (graceful fallback to procfs/kill liveness checks), supporting Go, JVM, V8/Node.js, .NET, and jemalloc allocators without relying on kernel-specific VMA naming.
+### 2. Virtual Reservation Optimization
+- **Bypassing Uncommitted Reservations:** Cloud-native sidecars (Prometheus Exporters, Fluentbit) frequently reserve over 1.2 GiB of uncommitted virtual address space via Go/JVM runtimes.
+- PodDump inspects `/proc/{pid}/smaps` to identify regions with `Rss: 0 kB` and `Swap: 0 kB`, safely skipping uncommitted allocations to reduce capture and freeze times.
+- Supports Linux 5.3+ `pidfd_open` and Linux 4.19+ `kill(0)` liveness verification.
 
-### 3. Minimized Service Downtime & Low Stop Latency
-- **Sub-100ms Target Freeze Under Typical Load**: `ProcDump` holds processes frozen during disk writes and fsync, causing stop latencies up to **531 ms** and dropping live TCP connections under load (3 query timeouts recorded on Redis).
-- PodDump captures memory into a 512 MiB in-memory snapshot buffer and **immediately resumes the target** (freeze limited to 14 ms ~ 90 ms in typical workloads), persisting data asynchronously to minimize service disruption (targets exceeding 512 MiB transition to streaming mode while stopped; under severe host CPU saturation, freeze latencies can extend).
+### 3. Minimized Process Freeze Latency
+- **Reduced Target Downtime:** Copies process memory into an in-memory buffer to quickly resume the target, while persisting data asynchronously to disk.
 
-### 4. Node Safety via Shared Kernel Budget (`credits-v3`)
-- Uses Linux Open File Description (OFD) range locks on `/run/poddump-<uid>/credits-v3` to enforce node-wide resource quotas across concurrent PodDump instances:
-  - Max 4 concurrently stopped processes node-wide
-  - Max 512 MiB total snapshot buffer target
-  - Soft write backlog reservation (1 GiB nominal)
-- Enforces strict FIFO admission, mitigating the risk of node OOM Killer cascades and unconstrained disk I/O bursts.
+### 4. Node Safety via Shared Budget Protocol (`credits-v3`)
+- Regulates concurrent stops (max 4 processes), snapshot memory, and I/O load across concurrent PodDump runs using OFD file locks to prevent node overload.
 
 ### 5. Forensic Integrity & Sparse File Optimization
-- **Zero Data Fabrication**: Unlike GDB, which inserts fake 4 KiB zero pages when reading unreadable kernel structures (`[vsyscall]`), PodDump never fabricates data. Unreadable ranges are omitted from `PT_LOAD` and audited with exact byte addresses and errno in `manifest.json`.
-- **Sparse Block Writing**: Utilizes runtime-detected AVX2 SIMD zero detection (with 4-unrolled u64 scalar fallback) to skip 64 KiB zero blocks via `lseek(SEEK_CUR)`, reducing physical disk block allocation (`AllocatedBytes`) by 20% ~ 48% (saving 52~189 MB per dump).
+- Unreadable kernel-special ranges are not zero-filled; uncollected ranges are logged with exact addresses and errno in `manifest.json`.
+- Detects zero blocks to write output as sparse files, saving physical disk allocation.
 
 ---
 
