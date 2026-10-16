@@ -77,6 +77,7 @@ fn read_maps(pid: i32) -> Result<Vec<Mapping>, CorexError> {
                 .ok_or_else(|| CorexError::InvalidData("invalid mapping line in proc maps".into()))?,
         );
     }
+    disambiguate_map_files(pid, &mut mappings);
     if mappings.iter().any(is_large_anon_prot_none) {
         if let Ok(smaps_raw) = fs::read(format!("/proc/{pid}/smaps")) {
             let smaps_contents = String::from_utf8_lossy(&smaps_raw);
@@ -84,6 +85,22 @@ fn read_maps(pid: i32) -> Result<Vec<Mapping>, CorexError> {
         }
     }
     Ok(mappings)
+}
+
+fn disambiguate_map_files(pid: i32, mappings: &mut [Mapping]) {
+    use std::os::unix::ffi::OsStrExt;
+    for m in mappings.iter_mut() {
+        if m.is_file_backed && m.raw_path.starts_with(b"/") {
+            let link_path = format!("/proc/{pid}/map_files/{:x}-{:x}", m.start, m.end);
+            if let Ok(target) = fs::read_link(&link_path) {
+                let raw = target.as_os_str().as_bytes().to_vec();
+                if !raw.is_empty() {
+                    m.path = String::from_utf8_lossy(&raw).into_owned();
+                    m.raw_path = raw;
+                }
+            }
+        }
+    }
 }
 
 fn filter_uncommitted_prot_none(mappings: &mut [Mapping], smaps: &str) {
@@ -387,5 +404,13 @@ Swap:                  0 kB\n";
         assert_eq!(mapping.end, 0xffff800080021000);
         assert!(mapping.path.contains("test_"));
         assert_eq!(mapping.raw_path, b"/usr/bin/test_\xff\xfe\xfd");
+    }
+
+    #[test]
+    fn disambiguate_map_files_safe_fallback_on_inaccessible() {
+        let mapping = parse_mapping(b"1000-2000 r--p 00000000 08:01 42 /tmp/test\\012file").unwrap();
+        let mut mappings = vec![mapping];
+        disambiguate_map_files(9999999, &mut mappings);
+        assert_eq!(mappings[0].raw_path, b"/tmp/test\\012file");
     }
 }

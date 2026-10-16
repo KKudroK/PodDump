@@ -134,7 +134,8 @@ pub fn publish_file(source: &Path, destination: &Path, owned: &File) -> io::Resu
     // Fail closed on unsupported kernels/filesystems. Never fall back to an
     // existence check followed by an overwriting rename.
     let rc = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             source.as_ptr(),
             libc::AT_FDCWD,
