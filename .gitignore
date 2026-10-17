@@ -1,11 +1,22 @@
+# Build and release artifacts
 /target/
+/release/
 /releases/
 /release_assets/
+
+# Developer and maintenance scripts
+/scripts/
+
+# Execution outputs, dumps, and cases
 /artifacts/
 /dumps/
 /cases/
+/benchmarks/
 *.core
+*.lime
 *.partial
+
+# Python and IDE cache
 __pycache__/
 *.py[cod]
 .env
@@ -13,7 +24,6 @@ __pycache__/
 /.vscode/
 
 # Internal experiment outputs stay outside the distribution tree.
-/benchmarks/
 /docs/*_20[0-9][0-9]*
 /acceptance_record.json
 /ops_hardening_record_*.json
