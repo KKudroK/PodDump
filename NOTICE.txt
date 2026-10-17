@@ -21,3 +21,7 @@ descriptions, data-writeback overlap, and explicit final directory persistence.
 
 Version 0.2.1 adds hierarchical terminal output, JSON compatibility, full-ID
 display, and the --pod alias. Memory acquisition and durability logic are unchanged.
+
+Version 0.3.1 adds per-Pod admission, static musl distribution and generated
+build/executable hash provenance. RustCrypto SHA-256 dependencies and their
+licenses are included in vendor/.

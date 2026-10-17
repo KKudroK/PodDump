@@ -110,7 +110,8 @@ impl Coverage {
         self.excluded_kernel_special_bytes = excl_kernel_special;
     }
     pub(super) fn unattempted_bytes(&self) -> u64 {
-        self.requested_bytes.saturating_sub(self.captured_bytes + self.failed_bytes)
+        self.requested_bytes
+            .saturating_sub(self.captured_bytes + self.failed_bytes)
     }
     pub(super) fn complete(&self) -> bool {
         self.failed_bytes == 0
@@ -1113,7 +1114,9 @@ mod maximum_coverage_regressions {
     }
     #[test]
     fn simd_zero_detection_matches_scalar_across_alignments_and_sizes() {
-        for size in [0usize, 1, 7, 15, 16, 31, 32, 63, 64, 127, 128, 255, 4096, 65536] {
+        for size in [
+            0usize, 1, 7, 15, 16, 31, 32, 63, 64, 127, 128, 255, 4096, 65536,
+        ] {
             let mut buf = vec![0u8; size];
             assert!(is_all_zero(&buf));
             assert!(is_all_zero_scalar(&buf));
@@ -1128,8 +1131,16 @@ mod maximum_coverage_regressions {
         }
         let process = tests::process();
         let mem = File::open("/dev/zero").unwrap();
-        let snap = snapshot_reserved(&process, b"note-bytes", None, &mem, "proc_mem", &|| Ok(()), None)
-            .unwrap();
+        let snap = snapshot_reserved(
+            &process,
+            b"note-bytes",
+            None,
+            &mem,
+            "proc_mem",
+            &|| Ok(()),
+            None,
+        )
+        .unwrap();
         let l = layout(&process, b"note-bytes").unwrap();
         let bytes = snap.bytes();
         assert!(is_all_zero(&bytes[176..l.note as usize]));

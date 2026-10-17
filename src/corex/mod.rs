@@ -216,13 +216,12 @@ pub(crate) fn capture(
             let stat_path = format!("/proc/{pid}/task/{tid}/stat");
             let stat_raw = std::fs::read(&stat_path)
                 .map_err(|e| CorexError::io("read thread identity", stat_path, e))?;
-            let rparen = stat_raw
-                .iter()
-                .rposition(|&b| b == b')')
-                .ok_or_else(|| CorexError::InvalidData("invalid thread stat: missing closing parenthesis".into()))?;
-            let tail_bytes = stat_raw
-                .get(rparen + 1..)
-                .ok_or_else(|| CorexError::InvalidData("invalid thread stat: missing tail".into()))?;
+            let rparen = stat_raw.iter().rposition(|&b| b == b')').ok_or_else(|| {
+                CorexError::InvalidData("invalid thread stat: missing closing parenthesis".into())
+            })?;
+            let tail_bytes = stat_raw.get(rparen + 1..).ok_or_else(|| {
+                CorexError::InvalidData("invalid thread stat: missing tail".into())
+            })?;
             let tail = std::str::from_utf8(tail_bytes)
                 .map_err(|_| CorexError::InvalidData("invalid thread stat encoding".into()))?;
             let starttime = tail

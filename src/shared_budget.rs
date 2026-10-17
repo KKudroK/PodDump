@@ -43,7 +43,10 @@ pub fn automatic_path() -> Result<PathBuf, String> {
             Ok(()) => (),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
             Err(e) => {
-                last_err = format!("create shared resource directory {}: {e}", directory.display());
+                last_err = format!(
+                    "create shared resource directory {}: {e}",
+                    directory.display()
+                );
                 continue;
             }
         }
@@ -54,10 +57,7 @@ pub fn automatic_path() -> Result<PathBuf, String> {
                 continue;
             }
         };
-        if !metadata.file_type().is_dir()
-            || metadata.uid() != uid
-            || metadata.mode() & 0o077 != 0
-        {
+        if !metadata.file_type().is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
             last_err =
                 "automatic resource directory must be private and owned by the caller".into();
             continue;

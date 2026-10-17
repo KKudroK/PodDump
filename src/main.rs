@@ -1,8 +1,10 @@
 #![recursion_limit = "256"]
+mod build_info;
 mod cli_output;
 mod corex;
 mod identity;
 mod pipeline;
+mod pod_lock;
 mod safe_output;
 mod shared_budget;
 mod shared_queue;
@@ -204,16 +206,24 @@ struct SyncWork {
     _lease: pipeline::Lease,
     _shared: Option<shared_budget::SharedLease>,
 }
-fn run() -> Result<bool, String> {
+fn run() -> Result<i32, String> {
     let clock_start = clock_pair();
     let total_begin = now();
     let total_timer = Instant::now();
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && args[1] == "--version" {
+        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        return Ok(0);
+    }
+    if args.len() == 2 && args[1] == "--build-info" {
+        println!("{}", build_info::current());
+        return Ok(0);
+    }
     if args.len() == 1 || args.iter().any(|s| s == "--help") {
         #[cfg(not(feature = "development-options"))]
         {
             println!(
-                "PodDump {}\nUsage: poddump --pod FULL_POD_UID --output NEW_DIR [--request-id ID]\n\nAttempts every mapped memory range for one local Pod UID, including the sandbox; unread bytes are explicit gaps.\nRead/write parallelism, shared node budgets and durable storage are managed internally.\nEach process is captured independently, not a Pod-atomic snapshot.\nRequires the host Linux proc/cgroup mounts and ptrace access.\nExit 0 confirms complete capture and durable publication; preserve stderr on failure.",
+                "PodDump {}\nUsage: poddump --pod FULL_POD_UID --output NEW_DIR [--request-id ID] [--wait-timeout-ms 0..3600000]\n\nAttempts every mapped memory range for one local Pod UID, including the sandbox; unread bytes are explicit gaps.\nRead/write parallelism, shared node budgets and durable storage are managed internally.\nEach process is captured independently, not a Pod-atomic snapshot.\nRequires the host Linux proc/cgroup mounts and ptrace access.\nSame-Pod requests wait before discovery (default 60000 ms); identical active request-id returns exit 3 and its output link.\nExit 0 confirms complete capture and durable publication; preserve stderr on failure.\n--version and --build-info report the version and actual executable SHA-256.",
                 env!("CARGO_PKG_VERSION")
             );
         }
@@ -222,7 +232,7 @@ fn run() -> Result<bool, String> {
             "PodDump {} (ProcDump Linux 3.5.3 corex-derived)\nUsage: poddump --pod UUID --output NEW_DIR [OPTIONS]\n\n  --pod UUID                     Full Pod UID on the local node\n  --output NEW_DIR               New output directory\n  --format tree|json             Terminal output (default: tree)\n  --full-ids                     Show full container IDs in the tree\n  --jobs 1..16                   Concurrent process workers (default: 4)\n  --memory-mib N                 Snapshot budget (default: 512)\n  --buffer-mib N                 Per-target buffer ceiling (default: 512)\n  --writers 1..16               Independent writers (default: 2)\n  --sync-jobs 1..16             Independent finalizers (default: 1)\n  --pending-mib N               Pending output credits (default: 1024)\n  --writeback none|hint          Writeback experiment (default: none)\n  --shared-budget FILE          Shared private node-credit file\n  --global-jobs 1..16            Shared capture slots (default: 4)\n  --sync-coordination node|none Node core-fsync coordination (default:node)\n  --global-pending 1..64         Unfinished targets held through durability (default:4)\n  --buffer-policy overlap|latency Snapshot admission policy\n  --stop-timeout-ms 1..60000      Stop cap (default: 5000)\n  --trace-level stages|basic     Stage/syscall diagnostics\n  --request-id ID                Caller correlation label\n  --stream                      Capture while stopped\n  --durability batch|per-process Ready-file grouping (default: batch)\n  --census-rounds 0..8           Additional census rounds (default: 2)\n  --timeout-ms 1..3600000        Capture/write deadline (default: 60000)\n\nCompatibility: --pod-uid is an alias for --pod.\nLocal Linux cgroup v1/v2 host (containerd, CRI-O, Docker); includes sandbox processes.\nEach process is captured independently; this is not a Pod-atomic snapshot.",
             env!("CARGO_PKG_VERSION")
         );
-        return Ok(true);
+        return Ok(0);
     }
     let valued = [
         "--pod",
@@ -247,13 +257,21 @@ fn run() -> Result<bool, String> {
         "--buffer-policy",
         "--trace-level",
         "--request-id",
+        "--wait-timeout-ms",
     ];
     let mut i = 1;
     let mut keys = std::collections::BTreeSet::new();
     while i < args.len() {
         let k = &args[i];
         if !cfg!(feature = "development-options")
-            && !["--pod", "--pod-uid", "--output", "--request-id"].contains(&k.as_str())
+            && ![
+                "--pod",
+                "--pod-uid",
+                "--output",
+                "--request-id",
+                "--wait-timeout-ms",
+            ]
+            .contains(&k.as_str())
         {
             return Err(format!("unknown option: {k}; use --help"));
         }
@@ -427,6 +445,28 @@ fn run() -> Result<bool, String> {
     {
         return Err("request-id must contain1..128 ASCII letters/digits or -_.:".into());
     }
+    let wait_timeout = val("--wait-timeout-ms", "60000")
+        .parse::<u64>()
+        .map_err(|_| "invalid wait-timeout-ms")?;
+    if wait_timeout > 3600000 {
+        return Err("wait-timeout-ms must be 0..3600000".into());
+    }
+    let lock_path = shared_budget::automatic_path()?;
+    let pod_lease = match pod_lock::acquire(
+        lock_path.parent().ok_or("no runtime directory")?,
+        &uid,
+        &request_id,
+        &out,
+        wait_timeout,
+        || CANCEL.load(Ordering::Relaxed),
+    )? {
+        pod_lock::Admission::Acquired(lease) => lease,
+        pod_lock::Admission::Linked(info) => {
+            println!("{}", info);
+            return Ok(3);
+        }
+    };
+    // Discovery happens after admission, so queued requests do not use stale PIDs.
     let root = identity::resolve(&uid)?;
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|e| e.to_string())?;
     let (mut initial, mut initial_errors) = identity::census(&root, &uid)?;
@@ -714,9 +754,10 @@ fn run() -> Result<bool, String> {
                     .and_then(|e| e.as_array())
                     .is_some_and(|e| !e.is_empty())
         });
-    let mut manifest = json!({"schema":2,"durability_contract":"Manifest status describes collection completeness; successful process exit is also required to confirm final manifest/output/parent directory persistence. On persistence failure preserve stderr emergency_manifest and nonzero exit.","build_provenance":serde_json::from_str::<Value>(include_str!("../build_provenance.json")).unwrap(),"timebase":"CLOCK_MONOTONIC nanoseconds","wall_time_unix_ns":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),"tool":"PodDump","version":env!("CARGO_PKG_VERSION"),"upstream":"ProcDump-Linux 3.5.3 8e34cbfaf57b38ca6b73160031e360edcbe6b9c1","pod_uid":uid,"cgroup_root":root,"boot_id":boot.trim(),"node":fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim(),"collection_policy":"all_mapped_proc_mem","durability":durability,"pending_fd_limit":pending_fd_limit,"durability_barriers":durability_barriers,"durability_begin_ns":durability_begin_ns,"durability_complete_ns":durability_complete_ns,"reader":reader,"initial_census_stable":initial_stable,"timeout_per_process_ms":timeout,"timeout_scope":"cooperative capture/write deadline; final durability attempts finish after capture; kernel I/O may block","cancel_requested":cancel_requested,"jobs":jobs,"buffer_ceiling_per_target":limit,"writers":writers,"sync_jobs":sync_jobs,"writeback_policy":writeback,"pipeline":budget.metrics(),"stream_scratch_limit_bytes":jobs*pipeline::MIB,"stream":stream,"begin_ns":begin,"discovery_complete_ns":discovery_complete,"discovery_s":discovery_s,"memory_budget_bytes":aggregate,"end_ns":now(),"elapsed_s":timer.elapsed().as_secs_f64(),"initial":initial,"censuses":censuses,"uncaptured_new":batch,"processes":results,"status":if success{"complete"}else{"partial"},"atomicity":"Each process stopped independently; shared mappings may change externally; not a Pod-atomic snapshot","registers":"GP and FP regsets (upstream), x86 XSAVE additionally captured"});
+    let mut manifest = json!({"schema":2,"durability_contract":"Manifest status describes collection completeness; successful process exit is also required to confirm final manifest/output/parent directory persistence. On persistence failure preserve stderr emergency_manifest and nonzero exit.","build_provenance":build_info::current(),"timebase":"CLOCK_MONOTONIC nanoseconds","wall_time_unix_ns":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),"tool":"PodDump","version":env!("CARGO_PKG_VERSION"),"upstream":"ProcDump-Linux 3.5.3 8e34cbfaf57b38ca6b73160031e360edcbe6b9c1","pod_uid":uid,"cgroup_root":root,"boot_id":boot.trim(),"node":fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim(),"collection_policy":"all_mapped_proc_mem","durability":durability,"pending_fd_limit":pending_fd_limit,"durability_barriers":durability_barriers,"durability_begin_ns":durability_begin_ns,"durability_complete_ns":durability_complete_ns,"reader":reader,"initial_census_stable":initial_stable,"timeout_per_process_ms":timeout,"timeout_scope":"cooperative capture/write deadline; final durability attempts finish after capture; kernel I/O may block","cancel_requested":cancel_requested,"jobs":jobs,"buffer_ceiling_per_target":limit,"writers":writers,"sync_jobs":sync_jobs,"writeback_policy":writeback,"pipeline":budget.metrics(),"stream_scratch_limit_bytes":jobs*pipeline::MIB,"stream":stream,"begin_ns":begin,"discovery_complete_ns":discovery_complete,"discovery_s":discovery_s,"memory_budget_bytes":aggregate,"end_ns":now(),"elapsed_s":timer.elapsed().as_secs_f64(),"initial":initial,"censuses":censuses,"uncaptured_new":batch,"processes":results,"status":if success{"complete"}else{"partial"},"atomicity":"Each process stopped independently; shared mappings may change externally; not a Pod-atomic snapshot","registers":"GP and FP regsets (upstream), x86 XSAVE additionally captured"});
     manifest["request_id"] = json!(request_id);
     manifest["global_pending_limit"] = json!(global_pending);
+    manifest["pod_admission"] = pod_lease.diagnostics.clone();
     manifest["node_sync_coordination"] = json!({"mode":sync_coordination,"core_fsync_limit":if sync_coordination=="node" && shared.is_some(){Some(1)}else{None},"participation":"all callers must use the same shared budget path and support this coordination; older binaries do not participate","cancellation":"final durable attempts may wait beyond capture cancellation, like fsync itself; no target is stopped while waiting"});
     manifest["clock_correlation"] = json!({"start":clock_start,"end":clock_pair()});
     manifest["scheduling"] = json!({"shared_budget":shared_path,"global_jobs":global_jobs,"buffer_policy":buffer_policy,"admission_ceiling_bytes":admission_ceiling,"stop_timeout_ms":stop_timeout,"trace_level":trace_level,"shared_init_begin_ns":shared_init_begin,"shared_init_end_ns":shared_init_end,"manifest_reserve_begin_ns":reserve_begin,"manifest_reserve_end_ns":reserve_end,"final_pipeline_join_ns":now()});
@@ -747,7 +788,7 @@ fn run() -> Result<bool, String> {
             cli_output::tree(&manifest, &requested_out, elapsed_s, full_ids)
         );
     }
-    Ok(success)
+    Ok(if success { 0 } else { 2 })
 }
 fn main() {
     unsafe {
@@ -755,8 +796,7 @@ fn main() {
         libc::signal(libc::SIGTERM, signal as *const () as usize);
     }
     match run() {
-        Ok(true) => (),
-        Ok(false) => std::process::exit(2),
+        Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("PodDump: {e}");
             std::process::exit(1)

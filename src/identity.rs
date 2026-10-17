@@ -135,7 +135,9 @@ fn cgroup_search_roots() -> Vec<PathBuf> {
 pub fn resolve(uid: &str) -> Result<PathBuf, String> {
     let roots = cgroup_search_roots();
     if roots.is_empty() {
-        return Err("no cgroup filesystem found under /sys/fs/cgroup or /host/sys/fs/cgroup".into());
+        return Err(
+            "no cgroup filesystem found under /sys/fs/cgroup or /host/sys/fs/cgroup".into(),
+        );
     }
     // Exact conventional roots avoid walking every container for every UID.
     // Fallback retains discovery for custom hierarchies; membership is always
@@ -248,8 +250,8 @@ pub(crate) fn parse_stat_fields(stat_raw: &[u8]) -> Result<(char, u64), String> 
 
 impl Identity {
     pub fn read(pid: i32, uid: &str) -> Result<Self, String> {
-        let stat_raw = fs::read(format!("/proc/{pid}/stat"))
-            .map_err(|e| format!("PID {pid} stat: {e}"))?;
+        let stat_raw =
+            fs::read(format!("/proc/{pid}/stat")).map_err(|e| format!("PID {pid} stat: {e}"))?;
         let (state, starttime) = parse_stat_fields(&stat_raw)?;
         let cg_raw = fs::read(format!("/proc/{pid}/cgroup")).map_err(|e| e.to_string())?;
         let cg = String::from_utf8_lossy(&cg_raw);
@@ -341,8 +343,12 @@ mod tests {
         let norm = "12345678_1234_1234_1234_123456789abc";
         let cid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         for path in [
-            format!("/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod{norm}.slice/cri-containerd-{cid}.scope"),
-            format!("/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod{norm}.slice/crio-{cid}.scope"),
+            format!(
+                "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod{norm}.slice/cri-containerd-{cid}.scope"
+            ),
+            format!(
+                "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod{norm}.slice/crio-{cid}.scope"
+            ),
             format!("/kubepods.slice/kubepods-pod{norm}.slice/docker-{cid}.scope"),
             format!("/kubepods/besteffort/pod{uid}/{cid}"),
             format!("/kubepods/pod{uid}/crio-{cid}"),
@@ -350,9 +356,8 @@ mod tests {
             assert!(member(&path, uid));
             assert_eq!(extract_container_id(&path, uid).unwrap(), cid);
         }
-        let conmon_path = format!(
-            "/kubepods.slice/kubepods-pod{norm}.slice/crio-conmon-{cid}.scope"
-        );
+        let conmon_path =
+            format!("/kubepods.slice/kubepods-pod{norm}.slice/crio-conmon-{cid}.scope");
         assert!(extract_container_id(&conmon_path, uid).is_err());
 
         let cg_v1 = format!(

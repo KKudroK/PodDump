@@ -1,0 +1,35 @@
+{
+  "readme_rows": [
+    {
+      "pods": 1,
+      "pids": 6,
+      "poddump_s": 0.227726304,
+      "procdump_s": 0.519853584,
+      "gdb_s": 0.550088314
+    },
+    {
+      "pods": 2,
+      "pids": 12,
+      "poddump_s": 0.387177174,
+      "procdump_s": 0.912881848,
+      "gdb_s": 1.022162406
+    },
+    {
+      "pods": 4,
+      "pids": 24,
+      "poddump_s": 0.69105615,
+      "procdump_s": 1.743418597,
+      "gdb_s": 1.943779691
+    }
+  ],
+  "sources": [
+    {
+      "path": "D:\\BoB\\Project\\KKudroK\\experiments\\poddump_multiprocess_20261016_01\\outputs\\final_benchmark_results.json",
+      "sha256": "81d57dfb884318c1c529a115648840778ac24896c6f2a0334829ec0eb0525ead"
+    },
+    {
+      "path": "D:\\BoB\\Project\\KKudroK\\experiments\\poddump_multiprocess_20261016_02\\outputs\\poddump_v7_results.json",
+      "sha256": "50cb3f05913c2a0ae9de90f2ebbafd0b037880fa329428c5d6fde9940c9459d0"
+    }
+  ]
+}

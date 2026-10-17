@@ -5,7 +5,8 @@
 /release_assets/
 
 # Developer and maintenance scripts
-/scripts/
+/scripts/*
+!/scripts/build_release.py
 
 # Execution outputs, dumps, and cases
 /artifacts/
@@ -25,5 +26,7 @@ __pycache__/
 
 # Internal experiment outputs stay outside the distribution tree.
 /docs/*_20[0-9][0-9]*
+!/docs/history_readme_20261017_en.md
+!/docs/history_readme_20261017_ko.md
 /acceptance_record.json
 /ops_hardening_record_*.json

@@ -73,8 +73,9 @@ fn read_maps(pid: i32) -> Result<Vec<Mapping>, CorexError> {
             continue;
         }
         mappings.push(
-            parse_mapping(line)
-                .ok_or_else(|| CorexError::InvalidData("invalid mapping line in proc maps".into()))?,
+            parse_mapping(line).ok_or_else(|| {
+                CorexError::InvalidData("invalid mapping line in proc maps".into())
+            })?,
         );
     }
     disambiguate_map_files(pid, &mut mappings);
@@ -385,19 +386,25 @@ Swap:                  0 kB\n";
 
     #[test]
     fn kernel_special_unreadable_mappings_are_not_selected_for_dump() {
-        let vvar = parse_mapping(b"7fff7fbfb000-7fff7fbfd000 r--p 00000000 00:00 0 [vvar]").unwrap();
+        let vvar =
+            parse_mapping(b"7fff7fbfb000-7fff7fbfd000 r--p 00000000 00:00 0 [vvar]").unwrap();
         assert!(!vvar.should_dump);
-        let vsyscall = parse_mapping(b"ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0 [vsyscall]").unwrap();
+        let vsyscall =
+            parse_mapping(b"ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0 [vsyscall]")
+                .unwrap();
         assert!(!vsyscall.should_dump);
-        let vdso = parse_mapping(b"7fff7fbfe000-7fff7fc00000 r-xp 00000000 00:00 0 [vdso]").unwrap();
+        let vdso =
+            parse_mapping(b"7fff7fbfe000-7fff7fc00000 r-xp 00000000 00:00 0 [vdso]").unwrap();
         assert!(vdso.should_dump);
-        let heap = parse_mapping(b"000055a123400000-000055a123421000 rw-p 00000000 00:00 0 [heap]").unwrap();
+        let heap = parse_mapping(b"000055a123400000-000055a123421000 rw-p 00000000 00:00 0 [heap]")
+            .unwrap();
         assert!(heap.should_dump);
     }
 
     #[test]
     fn parses_mapping_with_non_utf8_path() {
-        let mut raw = b"ffff800080000000-ffff800080021000 r-xp 00000000 08:01 42 /usr/bin/test_".to_vec();
+        let mut raw =
+            b"ffff800080000000-ffff800080021000 r-xp 00000000 08:01 42 /usr/bin/test_".to_vec();
         raw.extend_from_slice(&[0xff, 0xfe, 0xfd]);
         let mapping = parse_mapping(&raw).unwrap();
         assert_eq!(mapping.start, 0xffff800080000000);
@@ -408,7 +415,8 @@ Swap:                  0 kB\n";
 
     #[test]
     fn disambiguate_map_files_safe_fallback_on_inaccessible() {
-        let mapping = parse_mapping(b"1000-2000 r--p 00000000 08:01 42 /tmp/test\\012file").unwrap();
+        let mapping =
+            parse_mapping(b"1000-2000 r--p 00000000 08:01 42 /tmp/test\\012file").unwrap();
         let mut mappings = vec![mapping];
         disambiguate_map_files(9999999, &mut mappings);
         assert_eq!(mappings[0].raw_path, b"/tmp/test\\012file");

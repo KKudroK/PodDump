@@ -49,9 +49,7 @@ pub fn tree(manifest: &Value, output: &Path, elapsed_s: f64, full_ids: bool) -> 
             .count()
     });
     let partial = manifest["processes"].as_array().map_or(0, |rows| {
-        rows.iter()
-            .filter(|row| row["status"] == "partial")
-            .count()
+        rows.iter().filter(|row| row["status"] == "partial").count()
     });
     let captured = complete + partial;
     let total: usize = groups.values().map(Vec::len).sum();
