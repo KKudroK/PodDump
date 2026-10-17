@@ -15,6 +15,23 @@ sudo ./poddump --pod FULL_POD_UID --output /evidence/new_collection
 
 Use an existing output parent and a new collection directory. Run on the target node with its host proc/cgroup view and ptrace access. Output storage must support private permissions and durable publication. [Supported environments and limits](docs/deployment.md).
 
+Actual output from a two-process test Pod on Ubuntu 24.04.5, using v0.3.1. Output-path lines are omitted here.
+
+```text
+PodDump 0.3.1
+Node: kkudrok-node  |  Scope: all_mapped_proc_mem  |  Durability: batch
+
+Pod: 1f4123ca-cbac-4c40-8085-77efc8ca5629
+├── Container: 2f7cf8919d5b…
+│   └── PID 77316   [OK]      77316_1235239.core
+└── Container: 55cf54e6f0ea…
+    └── PID 77281   [OK]      77281_1235229.core
+
+Result: COMPLETE  |  Processes: 2/2  |  Containers: 2  |  Elapsed: 0.235 s
+```
+
+[Full captured stdout](docs/examples/capture.stdout).
+
 ## Tested environments
 
 The same x86-64 release binary was used in every row.

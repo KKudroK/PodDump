@@ -15,6 +15,23 @@ sudo ./poddump --pod FULL_POD_UID --output /evidence/new_collection
 
 출력 부모 디렉터리는 미리 만들고, 수집 디렉터리는 새 경로를 지정합니다. 대상 노드의 호스트 proc/cgroup과 ptrace 권한이 필요합니다. 출력 저장소는 사적 권한과 내구 저장을 지원해야 합니다. [지원 환경과 한계](docs/deployment.md).
 
+Ubuntu 24.04.5에서 v0.3.1로 프로세스 2개인 시험 Pod를 수집한 실제 출력입니다. 출력 경로를 표시하는 뒷부분만 생략했습니다.
+
+```text
+PodDump 0.3.1
+Node: kkudrok-node  |  Scope: all_mapped_proc_mem  |  Durability: batch
+
+Pod: 1f4123ca-cbac-4c40-8085-77efc8ca5629
+├── Container: 2f7cf8919d5b…
+│   └── PID 77316   [OK]      77316_1235239.core
+└── Container: 55cf54e6f0ea…
+    └── PID 77281   [OK]      77281_1235229.core
+
+Result: COMPLETE  |  Processes: 2/2  |  Containers: 2  |  Elapsed: 0.235 s
+```
+
+[실제 stdout 전문](docs/examples/capture.stdout).
+
 ## 검증한 환경
 
 아래 환경에 동일한 x86-64 릴리즈 바이너리를 사용했습니다.

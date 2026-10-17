@@ -1,0 +1,14 @@
+PodDump 0.3.1
+Node: kkudrok-node  |  Scope: all_mapped_proc_mem  |  Durability: batch
+
+Pod: 1f4123ca-cbac-4c40-8085-77efc8ca5629
+├── Container: 2f7cf8919d5b…
+│   └── PID 77316   [OK]      77316_1235239.core
+└── Container: 55cf54e6f0ea…
+    └── PID 77281   [OK]      77281_1235229.core
+
+Result: COMPLETE  |  Processes: 2/2  |  Containers: 2  |  Elapsed: 0.235 s
+Output: /var/tmp/collector_portable_release_20261017_smoke/evidence/poddump_after
+Manifest: /var/tmp/collector_portable_release_20261017_smoke/evidence/poddump_after/manifest.json
+Container IDs abbreviated; full IDs are in the manifest (--full-ids to display).
+PIDs are host PIDs; sandbox processes are included.

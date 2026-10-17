@@ -1,0 +1,12 @@
+{
+  "experiment": "collector_portable_release_20261017",
+  "run": "collector_portable_release_20261017_smoke",
+  "environment": "Ubuntu 24.04.5 / Linux 6.8.0-147",
+  "files": [
+    {
+      "source_file": "poddump_after.stdout",
+      "sha256": "08f00e49395ccc2402b335984e1e56cc01a41cf699ea7f9d713d004d7f1c0478",
+      "file": "capture.stdout"
+    }
+  ]
+}
