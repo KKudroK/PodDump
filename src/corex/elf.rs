@@ -71,6 +71,7 @@ pub(super) struct Coverage {
     pub captured_bytes: u64,
     pub failed_bytes: u64,
     pub zero_chunk_bytes: u64,
+    pub stop_timeout_reached: bool,
     pub spans: Vec<ReadSpan>,
     pub gaps: Vec<ReadGap>,
 }
@@ -131,6 +132,7 @@ impl Coverage {
             "captured_bytes": self.captured_bytes,
             "failed_bytes": self.failed_bytes,
             "unattempted_bytes": self.unattempted_bytes(),
+            "stop_timeout_reached": self.stop_timeout_reached,
             "captured_zero_chunk_bytes": self.zero_chunk_bytes,
             "captured_runs": self.spans,
             "read_errors": self.gaps,
@@ -630,7 +632,13 @@ pub(super) fn snapshot_reserved(
         }
         Ok::<_, CorexError>(())
     })();
-    result.map_err(|e| e.with_coverage(s.stats.coverage.json()))?;
+    match result {
+        Ok(()) => {}
+        Err(CorexError::TimedOut) if s.stats.coverage.captured_bytes > 0 => {
+            s.stats.coverage.stop_timeout_reached = true;
+        }
+        Err(e) => return Err(e.with_coverage(s.stats.coverage.json())),
+    }
     let head = headers(process, notes, &l, &s.stats.coverage)?;
     data[..head.len()].copy_from_slice(&head);
     Ok(s)
@@ -651,6 +659,7 @@ pub(super) fn write<W: Write + Seek>(
         notes,
         c,
         memory,
+        &|| Ok(()),
         &mut vec![0; MEMORY_CHUNK_SIZE],
         None,
     )
@@ -663,6 +672,7 @@ pub(super) fn write_reserved<W: Write + Seek>(
     notes: &[u8],
     c: Option<&crate::engine::CancellationToken>,
     memory: &File,
+    alive: &dyn Fn() -> Result<(), CorexError>,
     buffer: &mut [u8],
     stats: Option<IoStats>,
 ) -> Result<IoStats, CorexError> {
@@ -688,7 +698,7 @@ pub(super) fn write_reserved<W: Write + Seek>(
         {
             let mut writes = 0u64;
             let mut elapsed = 0u128;
-            read_mapping(
+            let read_result = read_mapping(
                 memory,
                 m,
                 mi,
@@ -697,7 +707,7 @@ pub(super) fn write_reserved<W: Write + Seek>(
                 buffer,
                 &mut stats,
                 c,
-                &|| Ok(()),
+                alive,
                 |off, bytes| {
                     let begin = crate::now();
                     let result = output
@@ -708,14 +718,21 @@ pub(super) fn write_reserved<W: Write + Seek>(
                     elapsed += crate::now() - begin;
                     result
                 },
-            )?;
+            );
             stats.write_calls += writes;
             stats.write_ns += elapsed;
+            read_result?;
             offset += mapping_size(m)?;
         }
         Ok::<_, CorexError>(())
     })();
-    result.map_err(|e| e.with_coverage(stats.coverage.json()))?;
+    match result {
+        Ok(()) => {}
+        Err(CorexError::TimedOut) if stats.coverage.captured_bytes > 0 => {
+            stats.coverage.stop_timeout_reached = true;
+        }
+        Err(e) => return Err(e.with_coverage(stats.coverage.json())),
+    }
     let head = headers(process, notes, &l, &stats.coverage)?;
     output
         .seek(SeekFrom::Start(0))
@@ -1103,6 +1120,7 @@ mod maximum_coverage_regressions {
             &[],
             None,
             &memory,
+            &|| Ok(()),
             &mut scratch,
             None,
         )
@@ -1210,5 +1228,123 @@ mod maximum_coverage_regressions {
         assert_eq!(j["excluded_bytes"], 6 * page);
         assert_eq!(j["excluded_uncommitted_prot_none_bytes"], 4 * page);
         assert_eq!(j["excluded_kernel_special_bytes"], 2 * page);
+    }
+
+    #[test]
+    fn stream_writer_enforces_alive_callback_between_chunks() {
+        let process = tests::process();
+        let zero = File::open("/dev/zero").unwrap();
+        let mut out = std::io::Cursor::new(Vec::new());
+        let mut scratch = vec![0; MEMORY_CHUNK_SIZE];
+        let err = write_reserved(
+            Path::new("stream_alive"),
+            &mut out,
+            &process,
+            &[],
+            None,
+            &zero,
+            &|| Err(CorexError::InvalidData("target exited mid-stream".into())),
+            &mut scratch,
+            None,
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("target exited mid-stream"));
+    }
+
+    #[test]
+    fn stop_timeout_after_first_mapping_preserves_valid_partial_elf_in_both_modes() {
+        let mut process = tests::process();
+        let page = process.page_size;
+        process.mappings = vec![
+            Mapping {
+                start: 0x1000,
+                end: 0x1000 + page,
+                flags: 4,
+                offset: 0,
+                is_shared: false,
+                is_file_backed: false,
+                should_dump: true,
+                path: "first".into(),
+                raw_path: b"first".to_vec(),
+            },
+            Mapping {
+                start: 0x2000,
+                end: 0x2000 + page,
+                flags: 4,
+                offset: 0,
+                is_shared: false,
+                is_file_backed: false,
+                should_dump: true,
+                path: "second".into(),
+                raw_path: b"second".to_vec(),
+            },
+        ];
+        let zero = File::open("/dev/zero").unwrap();
+        let token = crate::engine::CancellationToken::with_timeout(60_000);
+        let calls = std::cell::Cell::new(0usize);
+        let alive = || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            if n == 2 {
+                // Simulate stop_token timing out after the first mapping is captured.
+                std::thread::sleep(std::time::Duration::from_millis(60));
+            }
+            Ok(())
+        };
+        let stop_token = token.capped(40);
+        let snap = snapshot_reserved(
+            &process,
+            b"NOTE",
+            Some(&stop_token),
+            &zero,
+            "proc_mem",
+            &alive,
+            None,
+        )
+        .unwrap();
+        assert!(snap.stats.coverage.stop_timeout_reached);
+        assert!(!snap.stats.coverage.complete());
+        assert_eq!(snap.stats.coverage.captured_bytes, page);
+        assert_eq!(snap.stats.coverage.unattempted_bytes(), page);
+        assert_eq!(snap.stats.coverage.spans.len(), 1);
+        assert_eq!(&snap.bytes()[..4], b"\x7fELF");
+        assert!(read_elf(snap.bytes(), 0x1000).is_some());
+        assert!(read_elf(snap.bytes(), 0x2000).is_none());
+
+        let mut out = std::io::Cursor::new(Vec::new());
+        let mut scratch = vec![0; MEMORY_CHUNK_SIZE];
+        let calls_stream = std::cell::Cell::new(0usize);
+        let stop_stream = token.capped(40);
+        let alive_stream = || {
+            let n = calls_stream.get() + 1;
+            calls_stream.set(n);
+            if n == 2 {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+            }
+            Ok(())
+        };
+        let stats = write_reserved(
+            Path::new("stream_partial"),
+            &mut out,
+            &process,
+            b"NOTE",
+            Some(&stop_stream),
+            &zero,
+            &alive_stream,
+            &mut scratch,
+            None,
+        )
+        .unwrap();
+        assert!(stats.coverage.stop_timeout_reached);
+        assert!(!stats.coverage.complete());
+        assert_eq!(stats.coverage.captured_bytes, page);
+        assert_eq!(stats.coverage.unattempted_bytes(), page);
+        assert_eq!(
+            out.get_ref().as_slice(),
+            &snap.bytes()[..out.get_ref().len()]
+        );
+        assert!(read_elf(out.get_ref(), 0x1000).is_some());
+        assert!(read_elf(out.get_ref(), 0x2000).is_none());
     }
 }

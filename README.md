@@ -6,6 +6,9 @@ The 2026-11-05 source review fixes collection omissions and identity checks. See
 
 Capture a Kubernetes Pod's process memory from its node using one Pod UID. `poddump` discovers container and sandbox processes, writes ELF core files, and records process identities, missing ranges and collection status in `manifest.json`.
 
+
+Captured Core files now carry `details.core_sha256`, computed from the held capture inode after synchronization and before publication. Hash timing is recorded separately. Synthetic PRPSINFO scheduler state is unknown; the timestamped census state remains in the manifest. Older captures without this hash remain distinguishable.
+
 ## Run
 
 The release is one static Linux x86-64 executable. No GDB, glibc installation, container runtime CLI or adjacent files are required.
@@ -84,6 +87,6 @@ All cooperating collectors must share the same runtime directory and effective U
 python3 scripts/build_release.py
 ```
 
-Version **0.3.1**. The build script tests and emits `release/poddump` and a hash receipt. The receipt is optional at runtime. [Release checks](docs/release_validation.md) · [Earlier documentation](docs/history_readme_20261017_en.md).
+Version **0.4.0**. The build script tests and emits `release/poddump` and a hash receipt. The receipt is optional at runtime. [Changes and verified scope](docs/release_v0_4_0.md) · [Release checks](docs/release_validation.md) · [Earlier documentation](docs/history_readme_20261017_en.md).
 
 MIT license. Core-file code derives from Microsoft ProcDump for Linux; see [NOTICE.txt](NOTICE.txt).

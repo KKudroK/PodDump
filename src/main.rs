@@ -149,6 +149,16 @@ fn finalize_core(out: &Path, row: &mut Value, owned_file: Option<File>) {
             file.sync_all().map_err(|e| format!("fsync core: {e}"))?;
             row["details"]["durable_ns"] = json!(now());
         }
+        // Read via the held inode, never a replaceable pathname. The capture
+        // thread has already resumed the target before this durability stage.
+        use std::os::fd::AsRawFd;
+        let hash_begin = now();
+        let input = File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .map_err(|e| format!("open captured inode for digest: {e}"))?;
+        row["details"]["core_sha256"] =
+            json!(build_info::hash_reader(input).map_err(|e| format!("hash captured core: {e}"))?);
+        row["details"]["hash_begin_ns"] = json!(hash_begin);
+        row["details"]["hash_end_ns"] = json!(now());
         if row["details"]["coverage"]["complete"].as_bool() != Some(false) {
             row["details"]["rename_begin_ns"] = json!(now());
             safe_output::publish_file(&partial, &final_path, &file)
@@ -165,7 +175,13 @@ fn finalize_core(out: &Path, row: &mut Value, owned_file: Option<File>) {
         Ok(()) => {
             if row["details"]["coverage"]["complete"].as_bool() == Some(false) {
                 row["status"] = json!("partial");
-                row["error"] = json!("mapped bytes are missing; consult coverage ledger");
+                row["error"] = json!(
+                    if row["details"]["coverage"]["stop_timeout_reached"].as_bool() == Some(true) {
+                        "stop timeout reached before all mapped bytes were read; consult coverage ledger"
+                    } else {
+                        "mapped bytes are missing; consult coverage ledger"
+                    }
+                );
                 return;
             }
             row["status"] = json!("complete");
@@ -206,6 +222,15 @@ struct SyncWork {
     _lease: pipeline::Lease,
     _shared: Option<shared_budget::SharedLease>,
 }
+fn empty_census_error(errors: &[serde_json::Value]) -> String {
+    if errors.is_empty() {
+        "Pod cgroup has no live processes".into()
+    } else {
+        serde_json::json!({"stage":"initial_census", "error":"no_verified_process_identities",
+                           "census_errors":errors}).to_string()
+    }
+}
+
 fn run() -> Result<i32, String> {
     let clock_start = clock_pair();
     let total_begin = now();
@@ -495,7 +520,7 @@ fn run() -> Result<i32, String> {
     let discovery_complete = now();
     let discovery_s = total_timer.elapsed().as_secs_f64();
     if initial.is_empty() {
-        return Err("Pod cgroup has no live processes".into());
+        return Err(empty_census_error(&initial_errors));
     }
     let requested_out = out;
     let output_guard = safe_output::OutputDir::create(&requested_out)
@@ -699,6 +724,9 @@ fn run() -> Result<i32, String> {
                                 }
                                 failure=> {
                                     row["failure_stage"]=json!("capture");row["end_ns"]=json!(now());
+                                    if !file.exists() {
+                                        row.as_object_mut().unwrap().remove("partial_file");
+                                    }
                                     row["error"]=json!(match failure {Ok(Err(e))=>{if let Some(details)=e.coverage_details(){row["details"]=details;}e.to_string()},_=>{CANCEL.store(true,Ordering::Relaxed);"capture worker panicked".into()}});
                                     results.lock().unwrap_or_else(|e|e.into_inner()).push(row);
                                 }
@@ -1034,5 +1062,72 @@ mod coverage_publication_regressions {
         assert!(row["details"]["durable_ns"].is_number());
         fs::remove_file(p).unwrap();
         fs::remove_dir(d).unwrap();
+    }
+
+    #[test]
+    fn failed_capture_unlinks_owned_empty_partial_file() {
+        let d = std::env::temp_dir().join(format!(
+            "poddump_failed_partial_{}_{}",
+            std::process::id(),
+            now()
+        ));
+        fs::create_dir(&d).unwrap();
+        let p = d.join("999999_1.core.partial");
+        let f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&p)
+            .unwrap();
+        let id = identity::Identity {
+            pid: 999999,
+            starttime: 1,
+            cgroup: String::new(),
+            container_id: String::new(),
+            state: 'R',
+        };
+        let token = engine::CancellationToken::with_timeout(1000);
+        let result = corex::capture(
+            &id,
+            "00000000-0000-0000-0000-000000000000",
+            &p,
+            f,
+            &token,
+            4096,
+            false,
+            "proc_mem",
+            4096,
+        );
+        assert!(result.is_err());
+        assert!(!p.exists());
+        fs::remove_dir(d).unwrap();
+    }
+
+    #[test]
+    fn identity_failures_are_not_reported_as_an_empty_pod() {
+        assert_eq!(empty_census_error(&[]), "Pod cgroup has no live processes");
+        let errors = [json!({"pid":17,"error":"container identity unavailable"})];
+        let report: serde_json::Value = serde_json::from_str(&empty_census_error(&errors)).unwrap();
+        assert_eq!(report["error"], "no_verified_process_identities");
+        assert_eq!(report["census_errors"][0]["pid"], 17);
+    }
+
+    #[test]
+    fn failed_capture_cleanup_reports_replaced_file_without_removing_it() {
+        let d = std::env::temp_dir().join(format!("poddump_cleanup_{}_{}", std::process::id(), now()));
+        fs::create_dir(&d).unwrap();
+        let p = d.join("999999_1.core.partial");
+        let owned = OpenOptions::new().create_new(true).write(true).mode(0o600).open(&p).unwrap();
+        fs::rename(&p, d.join("owned_saved")).unwrap();
+        fs::write(&p, b"unrelated; preserve").unwrap();
+        let id = identity::Identity {pid:999999,starttime:1,cgroup:String::new(),container_id:String::new(),state:'R'};
+        let token = engine::CancellationToken::with_timeout(1000);
+        let error = match corex::capture(&id,"00000000-0000-0000-0000-000000000000",&p,owned,&token,4096,false,"proc_mem",4096) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid identity unexpectedly captured"),
+        };
+        assert!(error.to_string().contains("remove failed capture"));
+        assert_eq!(fs::read(&p).unwrap(), b"unrelated; preserve");
+        fs::remove_dir_all(d).unwrap();
     }
 }

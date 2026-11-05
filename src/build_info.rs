@@ -4,8 +4,7 @@ use std::{
     io::{self, Read},
 };
 
-fn executable_sha256() -> io::Result<String> {
-    let mut file = File::open("/proc/self/exe")?;
+pub fn hash_reader(mut file: impl Read) -> io::Result<String> {
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 65536];
     loop {
@@ -16,6 +15,9 @@ fn executable_sha256() -> io::Result<String> {
         hash.update(&buffer[..count]);
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+fn executable_sha256() -> io::Result<String> {
+    hash_reader(File::open("/proc/self/exe")?)
 }
 pub fn current() -> serde_json::Value {
     let mut value: serde_json::Value =

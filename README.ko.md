@@ -6,6 +6,9 @@
 
 Pod UID 하나로 해당 파드의 프로세스 메모리를 수집합니다. 노드에서 컨테이너·샌드박스 프로세스를 찾아 ELF core를 만들고, 실행 식별 정보·읽지 못한 범위·수집 상태를 `manifest.json`에 남깁니다.
 
+
+Core를 저장한 뒤 같은 파일의 SHA-256을 계산하여 `details.core_sha256`에 남깁니다. 해시 계산 시각도 따로 기록합니다. 직접 관측하지 않은 Core의 실행 상태는 미확인으로 두고, 수집 기록의 관측 시각이 있는 상태와 구분합니다. 해시가 없는 이전 수집본은 새 검증을 통과한 것으로 표시하지 않습니다.
+
 ## 실행
 
 Linux x86-64 정적 바이너리 `poddump` 하나로 실행합니다. GDB, glibc 설치, 컨테이너 런타임 CLI나 별도 설정 파일이 필요하지 않습니다.
@@ -84,6 +87,6 @@ Kali cloud 이미지의 배포명은 2026.2이며, 내부 `VERSION_ID`는 2026.1
 python3 scripts/build_release.py
 ```
 
-버전 **0.3.1**. 빌드 스크립트가 시험 후 `release/poddump`와 해시 증적을 만듭니다. 해시 파일은 실행에 필요하지 않습니다. [릴리즈 검증](docs/release_validation.md) · [이전 문서](docs/history_readme_20261017_ko.md).
+버전 **0.4.0**. 빌드 스크립트가 시험 후 `release/poddump`와 해시 증적을 만듭니다. 해시 파일은 실행에 필요하지 않습니다. [변경 내용과 검증 범위](docs/release_v0_4_0.md) · [릴리즈 검증](docs/release_validation.md) · [이전 문서](docs/history_readme_20261017_ko.md).
 
 MIT 라이선스입니다. Core 파일 코드는 Microsoft ProcDump for Linux에 기반합니다. [NOTICE.txt](NOTICE.txt).

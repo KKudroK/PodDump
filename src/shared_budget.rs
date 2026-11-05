@@ -15,8 +15,35 @@ const MEMORY: i64 = 4096;
 const BACKLOG: i64 = 1 << 42;
 const FILES: i64 = 1 << 44;
 const SYNC: i64 = 1 << 46;
+/// One independent open-file description per request. A concurrent fork can
+/// temporarily inherit even CLOEXEC descriptors. Closing only our descriptor
+/// would then keep reservations/queue liveness until that child execs/exits.
+/// Explicit unlock on normal drop makes release independent of that lifetime;
+/// kernel close/exit still provides the crash fallback.
+struct CreditFile(File);
+impl std::ops::Deref for CreditFile {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for CreditFile {
+    fn deref_mut(&mut self) -> &mut File {
+        &mut self.0
+    }
+}
+impl Drop for CreditFile {
+    fn drop(&mut self) {
+        if let Err(error) = lock(&self.0, 0, 0, libc::F_UNLCK as i16) {
+            eprintln!("release shared credit ranges: {error}");
+        }
+        if unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            eprintln!("release shared credit admission lock: {}", std::io::Error::last_os_error());
+        }
+    }
+}
 pub struct SyncPermit {
-    _file: File,
+    _file: CreditFile,
     begin_ns: u128,
     end_ns: u128,
 }
@@ -68,14 +95,14 @@ pub fn automatic_path() -> Result<PathBuf, String> {
 }
 pub struct SharedBudget {
     path: PathBuf,
-    anchor: File,
+    anchor: CreditFile,
     jobs: usize,
     memory: usize,
     backlog: usize,
     pending: usize,
 }
 pub struct SharedLease {
-    file: File,
+    file: CreditFile,
     locks: Vec<(i64, i64)>,
     memory: Option<(i64, i64)>,
     capture: Option<(i64, i64)>,
@@ -146,10 +173,10 @@ fn gap(
     }
     Ok(None)
 }
-fn open(path: &Path) -> Result<File, String> {
+fn open(path: &Path) -> Result<CreditFile, String> {
     open_with(path, true)
 }
-fn open_with(path: &Path, create: bool) -> Result<File, String> {
+fn open_with(path: &Path, create: bool) -> Result<CreditFile, String> {
     let f = OpenOptions::new()
         .read(true)
         .write(true)
@@ -170,7 +197,7 @@ fn open_with(path: &Path, create: bool) -> Result<File, String> {
                 .into(),
         );
     }
-    Ok(f)
+    Ok(CreditFile(f))
 }
 fn try_flock(file: &File) -> Result<bool, String> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -206,7 +233,7 @@ impl SharedBudget {
         }
         Ok(())
     }
-    fn open_instance(&self) -> Result<File, String> {
+    fn open_instance(&self) -> Result<CreditFile, String> {
         // Independent OFD for lock conflict semantics, but never a new inode.
         let file = open_with(&self.path, false)?;
         self.check_namespace(&file)?;
@@ -292,7 +319,7 @@ impl SharedBudget {
             "poddump-shared-v3 jobs={jobs} memory={memory} backlog={backlog} pending={pending} sync_slots=1 queue_slots=256 fifo=registered\n"
         );
         let mut current = String::new();
-        (&mut f)
+        (&mut *f)
             .take(config.len() as u64)
             .read_to_string(&mut current)
             .map_err(|e| e.to_string())?;
@@ -520,6 +547,34 @@ impl SharedLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inherited_description_does_not_delay_released_credits_or_queue_liveness() {
+        let path = std::env::temp_dir().join(format!(
+            "poddump_inherited_{}_{}", std::process::id(), crate::now()
+        ));
+        let budget = SharedBudget::new(&path, 1, 512, 1024).unwrap();
+        let held = budget.try_acquire(512, 1024).unwrap().unwrap();
+        // dup retains the same OFD just as fork does, without timing races.
+        let inherited = held.file.try_clone().unwrap();
+        assert!(budget.try_acquire(512, 1024).unwrap().is_none());
+        drop(held);
+        let next = budget.try_acquire(512, 1024).unwrap().unwrap();
+        drop(next);
+        drop(inherited);
+        let waiting = budget.open_instance().unwrap();
+        let mut probes = ProbeStats::default();
+        let _ticket = budget.try_register(&waiting, &mut probes).unwrap().unwrap();
+        let inherited_waiter = waiting.try_clone().unwrap();
+        drop(waiting);
+        assert!(budget.try_acquire(512, 1024).unwrap().is_some());
+        drop(inherited_waiter);
+        let sync = budget.acquire_sync().unwrap();
+        let inherited_sync = sync._file.try_clone().unwrap();
+        drop(sync);
+        assert!(lock(&open(&path).unwrap(), SYNC, 1, libc::F_WRLCK as i16).is_ok());
+        drop(inherited_sync);
+        std::fs::remove_file(path).unwrap();
+    }
     fn queued(budget: &SharedBudget) -> usize {
         let f = budget.open_instance().unwrap();
         let end = std::time::Instant::now() + Duration::from_secs(2);

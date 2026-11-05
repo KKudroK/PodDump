@@ -118,7 +118,9 @@ fn prstatus(process: &ProcessInfo, thread: &ThreadState) -> Result<Vec<u8>, Core
 
 fn prpsinfo(process: &ProcessInfo) -> Vec<u8> {
     let mut info = vec![0_u8; 136];
-    info[1] = b'R';
+    // Synthetic Core: no instantaneous scheduler state was observed here.
+    info[0] = 0xff;
+    info[1] = b'?';
     write_u32(&mut info, 16, process.uid);
     write_u32(&mut info, 20, process.gid);
     write_i32(&mut info, 24, process.pid);
