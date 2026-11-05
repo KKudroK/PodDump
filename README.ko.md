@@ -1,5 +1,7 @@
 # PodDump
 
+2026-11-05 소스 수정으로 수집 누락과 소속 판정 문제를 보완했습니다. [수정 내용과 검증 범위](docs/capture_review.md)를 참고하세요. 아래의 기존 릴리즈 수집 결과와 성능 수치는 이전 빌드의 기록입니다.
+
 [English](README.md) · [배포 조건](docs/deployment.md) · [측정 상세](docs/benchmark_summary.md)
 
 Pod UID 하나로 해당 파드의 프로세스 메모리를 수집합니다. 노드에서 컨테이너·샌드박스 프로세스를 찾아 ELF core를 만들고, 실행 식별 정보·읽지 못한 범위·수집 상태를 `manifest.json`에 남깁니다.

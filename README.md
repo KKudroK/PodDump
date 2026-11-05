@@ -1,5 +1,7 @@
 # PodDump
 
+The 2026-11-05 source review fixes collection omissions and identity checks. See [changes and validation limits](docs/capture_review.md). Earlier release captures and performance figures below describe previous builds.
+
 [한국어](README.ko.md) · [Deployment](docs/deployment.md) · [Benchmarks](docs/benchmark_summary.md)
 
 Capture a Kubernetes Pod's process memory from its node using one Pod UID. `poddump` discovers container and sandbox processes, writes ELF core files, and records process identities, missing ranges and collection status in `manifest.json`.
