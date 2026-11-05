@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -72,29 +72,15 @@ fn parse_container_segment(segment: &str) -> Option<&str> {
 }
 
 fn extract_container_id(cgroup: &str, uid: &str) -> Result<String, String> {
-    let mut after_pod = false;
-    let mut found: Option<&str> = None;
-    for seg in cgroup.split('/').filter(|s| !s.is_empty()) {
-        if is_pod_segment(seg, uid) {
-            after_pod = true;
-            continue;
-        }
-        if after_pod {
-            if let Some(id) = parse_container_segment(seg) {
-                found = Some(id);
-            }
-        }
-    }
-    if let Some(id) = found {
-        return Ok(id.to_string());
-    }
-    // Fallback for custom hierarchies where the 64-hex container scope appears anywhere in path
-    if let Some(id) = cgroup
+    // Retain custom hierarchy support, but never choose an arbitrary ID from
+    // nested container scopes. Duplicate references to the same ID are fine.
+    let mut ids: BTreeSet<_> = cgroup
         .split('/')
         .filter_map(parse_container_segment)
-        .next_back()
-    {
-        return Ok(id.to_string());
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if member(cgroup, uid) && ids.len() == 1 {
+        return Ok(ids.pop_first().unwrap());
     }
     Err(format!("ambiguous container attribution: {cgroup}"))
 }
@@ -206,24 +192,22 @@ pub fn resolve(uid: &str) -> Result<PathBuf, String> {
 }
 
 fn select_proc_cgroup(cg_contents: &str, uid: &str) -> Result<String, String> {
-    if let Some(unified) = cg_contents.lines().find_map(|l| l.strip_prefix("0::")) {
-        if member(unified, uid) {
-            return Ok(unified.to_string());
-        }
-    }
+    let mut paths = BTreeSet::new();
     for line in cg_contents.lines() {
-        if let Some((_, rest)) = line.split_once(':') {
-            if let Some((_, path)) = rest.split_once(':') {
-                if member(path, uid) {
-                    return Ok(path.to_string());
-                }
-            }
+        let fields: Vec<_> = line.splitn(3, ':').collect();
+        if fields.len() != 3 || fields[0].parse::<u32>().is_err() || !fields[2].starts_with('/') {
+            return Err("malformed proc cgroup entry".into());
+        }
+        if member(fields[2], uid) {
+            paths.insert(fields[2].to_string());
         }
     }
-    if let Some(unified) = cg_contents.lines().find_map(|l| l.strip_prefix("0::")) {
-        return Ok(unified.to_string());
+    if paths.len() > 1 {
+        return Err("ambiguous Pod membership across cgroup controllers".into());
     }
-    Err("no cgroup entry found".into())
+    paths
+        .pop_first()
+        .ok_or_else(|| format!("no cgroup entry belongs to Pod {uid}"))
 }
 
 pub(crate) fn parse_stat_fields(stat_raw: &[u8]) -> Result<(char, u64), String> {
@@ -250,12 +234,23 @@ pub(crate) fn parse_stat_fields(stat_raw: &[u8]) -> Result<(char, u64), String> 
 
 impl Identity {
     pub fn read(pid: i32, uid: &str) -> Result<Self, String> {
-        let stat_raw =
-            fs::read(format!("/proc/{pid}/stat")).map_err(|e| format!("PID {pid} stat: {e}"))?;
-        let (state, starttime) = parse_stat_fields(&stat_raw)?;
-        let cg_raw = fs::read(format!("/proc/{pid}/cgroup")).map_err(|e| e.to_string())?;
-        let cg = String::from_utf8_lossy(&cg_raw);
-        let cgroup = select_proc_cgroup(&cg, uid)?;
+        Self::read_with(pid, uid, |name| {
+            fs::read(format!("/proc/{pid}/{name}")).map_err(|e| format!("PID {pid} {name}: {e}"))
+        })
+    }
+    fn read_with(
+        pid: i32,
+        uid: &str,
+        mut read: impl FnMut(&str) -> Result<Vec<u8>, String>,
+    ) -> Result<Self, String> {
+        let (_, starttime) = parse_stat_fields(&read("stat")?)?;
+        let cg_raw = read("cgroup")?;
+        let cg = std::str::from_utf8(&cg_raw).map_err(|_| "non-UTF-8 proc cgroup path")?;
+        let cgroup = select_proc_cgroup(cg, uid)?;
+        let (state, after) = parse_stat_fields(&read("stat")?)?;
+        if after != starttime {
+            return Err(format!("PID {pid} replaced during identity read"));
+        }
         if !member(&cgroup, uid) {
             return Err(format!("PID {pid} no longer belongs to Pod {uid}"));
         }
@@ -280,6 +275,13 @@ impl Identity {
     }
 }
 pub fn census(root: &Path, uid: &str) -> Result<(Vec<Identity>, Vec<serde_json::Value>), String> {
+    census_with(root, uid, Identity::read)
+}
+fn census_with(
+    root: &Path,
+    uid: &str,
+    mut read: impl FnMut(i32, &str) -> Result<Identity, String>,
+) -> Result<(Vec<Identity>, Vec<serde_json::Value>), String> {
     let mut todo = vec![root.to_path_buf()];
     let mut ids = BTreeMap::new();
     let mut errors = Vec::new();
@@ -288,12 +290,19 @@ pub fn census(root: &Path, uid: &str) -> Result<(Vec<Identity>, Vec<serde_json::
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(e) => {
                 errors.push(serde_json::json!({"path":p,"error":e.to_string(),"kind":"cgroup_read_failure"}));
-                continue;
+                // A parent read failure must not hide readable child cgroups.
+                String::new()
             }
         };
         for line in procs.lines() {
-            let pid = line.parse().map_err(|_| "bad cgroup PID")?;
-            match Identity::read(pid, uid) {
+            let pid = match line.parse::<i32>() {
+                Ok(pid) if pid > 0 => pid,
+                _ => {
+                    errors.push(serde_json::json!({"path":p,"value":line,"error":"invalid cgroup PID","kind":"invalid_cgroup_pid"}));
+                    continue;
+                }
+            };
+            match read(pid, uid) {
                 Ok(id) => {
                     ids.insert(pid, id);
                 }
@@ -365,6 +374,91 @@ mod tests {
         );
         let selected = select_proc_cgroup(&cg_v1, uid).unwrap();
         assert_eq!(extract_container_id(&selected, uid).unwrap(), cid);
+    }
+    #[test]
+    fn conflicting_controller_membership_is_not_order_dependent() {
+        let uid = "12345678-1234-1234-1234-123456789abc";
+        let a = format!("/kubepods/pod{uid}/{}", "a".repeat(64));
+        let b = format!("/kubepods/pod{uid}/{}", "b".repeat(64));
+        for cg in [
+            format!("7:pids:{a}\n8:memory:{b}\n0::/\n"),
+            format!("0::{b}\n7:pids:{a}\n"),
+            format!("7:pids:{a}\n0::{b}\n"),
+        ] {
+            assert!(select_proc_cgroup(&cg, uid).is_err());
+        }
+        for cg in [
+            format!("0::/\n7:pids:{a}\n8:memory:{a}\n"),
+            format!("7:pids:{a}\n8:memory:{a}\n0::/\n"),
+        ] {
+            assert_eq!(select_proc_cgroup(&cg, uid).unwrap(), a);
+        }
+        assert!(select_proc_cgroup(&format!("bad:pids:{a}"), uid).is_err());
+    }
+    #[test]
+    fn distinct_nested_container_ids_are_not_silently_attributed() {
+        let uid = "12345678-1234-1234-1234-123456789abc";
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        assert!(extract_container_id(&format!("/pod{uid}/{a}/{b}"), uid).is_err());
+        assert!(extract_container_id(&format!("/{a}/pod{uid}/{b}"), uid).is_err());
+        assert_eq!(
+            extract_container_id(&format!("/pod{uid}/{a}/{a}"), uid).unwrap(),
+            a
+        );
+    }
+    #[test]
+    fn identity_read_rejects_pid_reuse_between_stat_and_cgroup() {
+        let uid = "12345678-1234-1234-1234-123456789abc";
+        for after in [100, 101] {
+            let mut reads = 0;
+            let id = Identity::read_with(42, uid, |name| {
+                if name == "cgroup" {
+                    return Ok(format!("0::/pod{uid}/{}", "a".repeat(64)).into_bytes());
+                }
+                assert_eq!(name, "stat");
+                reads += 1;
+                let ticks = if reads == 1 { 100 } else { after };
+                Ok(format!("42 (name ) test) S {} {ticks}", vec!["0"; 18].join(" ")).into_bytes())
+            });
+            assert_eq!(reads, 2);
+            assert_eq!(id.is_ok(), after == 100);
+        }
+    }
+    #[test]
+    fn census_keeps_children_and_other_pids_after_read_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "poddump_census_{}_{}",
+            std::process::id(),
+            crate::now()
+        ));
+        fs::create_dir_all(root.join("child")).unwrap();
+        fs::write(root.join("child/cgroup.procs"), "42\nbad\n0\n-1\n43\n").unwrap();
+        let uid = "12345678-1234-1234-1234-123456789abc";
+        let (ids, errors) = census_with(&root, uid, |pid, _| {
+            Ok(Identity {
+                pid,
+                starttime: 100,
+                cgroup: format!("/pod{uid}/{}", "a".repeat(64)),
+                container_id: "a".repeat(64),
+                state: 'S',
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            ids.iter().map(|id| id.pid).collect::<Vec<_>>(),
+            vec![42, 43]
+        );
+        assert_eq!(errors.len(), 4);
+        assert!(errors.iter().any(|e| e["kind"] == "cgroup_read_failure"));
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|e| e["kind"] == "invalid_cgroup_pid")
+                .count(),
+            3
+        );
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn live_identity_negative_controls() {
