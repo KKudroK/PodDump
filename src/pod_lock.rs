@@ -21,8 +21,6 @@ pub enum Admission {
     Linked(Value),
 }
 
-const STALE_LOCK_MAX_AGE_SECS: u64 = 3600;
-
 fn lock_range(file: &File, byte: i64, len: i64, kind: i16) -> Result<bool, String> {
     let mut range: libc::flock = unsafe { std::mem::zeroed() };
     range.l_type = kind;
@@ -47,59 +45,6 @@ fn lock(file: &File, byte: i64, kind: i16) -> Result<bool, String> {
     lock_range(file, byte, 1, kind)
 }
 
-/// Remove abandoned `pod-*.lock` files from prior completed runs when safe.
-/// Requires an exclusive whole-file OFD lock so active holders/waiters are never unlinked.
-fn gc_stale_locks(directory: &Path, active_path: &Path, current_boot: &str, max_age_secs: u64) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    let now_wall = std::time::SystemTime::now();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path == active_path {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !(name.starts_with("pod-") && name.ends_with(".lock")) {
-            continue;
-        }
-        let Ok(file) = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&path)
-        else {
-            continue;
-        };
-        if validate(&file, &path).is_err() {
-            continue;
-        }
-        if !matches!(lock_range(&file, 0, 0, libc::F_WRLCK as i16), Ok(true)) {
-            continue;
-        }
-        let stale_by_age = file
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| now_wall.duration_since(t).ok())
-            .is_some_and(|age| age.as_secs() >= max_age_secs);
-        let stale_by_boot = !current_boot.is_empty() && {
-            let mut f = &file;
-            let _ = f.seek(SeekFrom::Start(0));
-            let mut bytes = Vec::new();
-            let _ = f.take(16384).read_to_end(&mut bytes);
-            serde_json::from_slice::<Value>(&bytes)
-                .ok()
-                .and_then(|v| v["boot_id"].as_str().map(str::to_string))
-                .is_some_and(|b| !b.is_empty() && b != current_boot)
-        };
-        if stale_by_age || stale_by_boot {
-            let _ = fs::remove_file(&path);
-        }
-        let _ = lock_range(&file, 0, 0, libc::F_UNLCK as i16);
-    }
-}
 fn validate(file: &File, path: &Path) -> Result<(), String> {
     let a = file.metadata().map_err(|e| e.to_string())?;
     let b = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
@@ -126,11 +71,7 @@ pub fn acquire(
     cancelled: impl Fn() -> bool,
 ) -> Result<Admission, String> {
     crate::identity::valid_uid(uid)?;
-    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
     let path = directory.join(format!("pod-{uid}.lock"));
-    gc_stale_locks(directory, &path, &boot_id, STALE_LOCK_MAX_AGE_SECS);
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -239,39 +180,43 @@ mod tests {
     }
 
     #[test]
-    fn stale_lock_gc_removes_dead_prior_boot_and_preserves_active_lock() {
+    fn old_boot_lock_keeps_inode_when_another_pod_is_acquired() {
         let d = std::env::temp_dir().join(format!(
-            "poddump_lock_gc_{}_{}",
+            "poddump_lock_inode_{}_{}",
             std::process::id(),
             crate::now()
         ));
         fs::create_dir(&d).unwrap();
-        let active_uid = "11111111-1111-1111-1111-111111111111";
-        let stale_uid = "22222222-2222-2222-2222-222222222222";
-        let active = acquire(&d, active_uid, "req-1", Path::new("out1"), 100, || false).unwrap();
-        let stale_path = d.join(format!("pod-{stale_uid}.lock"));
-        let mut stale_file = OpenOptions::new()
+        let uid = "22222222-2222-2222-2222-222222222222";
+        let path = d.join(format!("pod-{uid}.lock"));
+        let mut opened = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
-            .open(&stale_path)
+            .open(&path)
             .unwrap();
-        stale_file
-            .write_all(
-                br#"{"pod_uid":"22222222-2222-2222-2222-222222222222","boot_id":"old-boot"}"#,
-            )
+        opened.write_all(br#"{"boot_id":"old-boot"}"#).unwrap();
+        let inode = opened.metadata().unwrap().ino();
+        let other = acquire(
+            &d,
+            "11111111-1111-1111-1111-111111111111",
+            "other",
+            Path::new("out"),
+            100,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert!(lock(&opened, 0, libc::F_WRLCK as i16).unwrap());
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
             .unwrap();
-        drop(stale_file);
-
-        let exclude = d.join("pod-33333333-3333-3333-3333-333333333333.lock");
-        gc_stale_locks(&d, &exclude, "current-boot", STALE_LOCK_MAX_AGE_SECS);
-        assert!(d.join(format!("pod-{active_uid}.lock")).exists());
-        assert!(!stale_path.exists());
-        drop(active);
-        fs::remove_file(d.join(format!("pod-{active_uid}.lock"))).unwrap();
-        fs::remove_dir(d).unwrap();
+        assert!(!lock(&second, 0, libc::F_WRLCK as i16).unwrap());
+        drop((other, opened, second));
+        fs::remove_dir_all(&d).unwrap();
     }
     trait ErrorText {
         fn unwrap_err_string(self) -> String;

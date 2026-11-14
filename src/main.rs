@@ -5,6 +5,7 @@ mod corex;
 mod identity;
 mod pipeline;
 mod pod_lock;
+mod rate_limit;
 mod safe_output;
 mod shared_budget;
 mod shared_queue;
@@ -601,7 +602,7 @@ fn run() -> Result<i32, String> {
     }
     let pending_fd_limit = descriptor_limit.rlim_cur.saturating_sub(64).min(256) as usize;
     if pending_fd_limit == 0 {
-        return Err("at least65 file descriptors are required".into());
+        return Err("at least 65 file descriptors are required".into());
     }
     let durability_barriers = Mutex::new(Vec::<Value>::new());
     let budget = pipeline::Budget::new(aggregate, backlog, pending_fd_limit);

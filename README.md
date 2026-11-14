@@ -1,97 +1,134 @@
 # PodDump
 
-**Version 0.5.0** reduces process stop times and production disk impact while preserving full logical SHA-256 integrity and forensic coverage. See the consolidated [code, feature, and evidence guide](docs/CODEBASE_GUIDE.md) (Korean) for implementation details. Earlier v0.3.1 output, distro tables, and 2026-10-16 Nginx measurements below remain historical build records.
+PodDump는 **Pod UID 하나를 받아, 해당 Pod의 프로세스 메모리를 파일로 저장하는 도구**입니다. 저장한 메모리 파일을 덤프라고 합니다. 각 프로세스의 ELF Core와 수집 결과를 적은 `manifest.json`을 만듭니다. 버전은 **0.5.0**입니다.
 
-[한국어](README.ko.md) · [Codebase guide (KO)](docs/CODEBASE_GUIDE.md) · [Deployment](docs/deployment.md) · [Benchmarks](docs/benchmark_summary.md)
+[다운로드](https://github.com/KKudroK/PodDump/releases/latest) · [빠른 시작](#빠른-시작) · [옵션](#옵션) · [결과 확인](#결과-확인) · [코드와 수집 원리](docs/CODEBASE_GUIDE.md)
 
-Capture a Kubernetes Pod's process memory from its node using one Pod UID. `poddump` discovers container and sandbox processes, writes ELF core files, and records process identities, missing/excluded ranges, SHA-256 digests, and collection status in `manifest.json`.
+## 실행 조건
 
-## What is new in v0.5.0
+- Linux x86-64 노드에서 실행합니다. 공개 바이너리는 ARM64용이 아닙니다.
+- 대상 Pod가 실행 중인 **노드에 접속**해야 합니다. 다른 노드의 Pod는 수집하지 못합니다.
+- 호스트의 `/proc`와 cgroup을 볼 수 있고 `ptrace`를 사용할 권한이 필요합니다. `ptrace`는 다른 프로세스를 멈추고 상태를 읽는 Linux 기능입니다. 일반적으로 `sudo`로 실행하지만, 노드의 보안 정책이 접근을 막으면 실패할 수 있습니다.
+- 출력에는 Linux 파일 권한과 `fsync`를 지원하는 저장소를 사용합니다. `fsync`는 파일을 저장 장치에 반영하도록 요청하는 기능입니다. 부모 디렉터리는 미리 만들고, 수집 결과 디렉터리는 매번 새 이름을 사용합니다.
 
-- **Two-stage zero-page skip & sparse write**: After verifying safe anonymous eligibility via `smaps` `VmFlags` (excluding `io`, `pf`, `ht`, `mm`, `sh`, `ui`, `uw`, `up`), Stage 1 uses `/proc/<pid>/pagemap` to skip reading unpopulated zero pages while Stage 2 uses AVX2 SIMD + `lseek` sparse holes for zero chunks that were read.
-- **Forensic coverage preservation**: Retains `MADV_DONTDUMP` (`dd`) regions inside `PT_LOAD` and excludes only uncommitted `PROT_NONE` guard regions (`rss == 0 && swap == 0`), accounting excluded bytes explicitly in `manifest.json`.
-- **Dynamic ELF header sizing & inline digest**: Dynamically sizes `PHDR` reservation (`MIN_PHDR_SLACK = 64` to `MAX_PHDR_SLACK = 1024`) to shrink small-container cores, and computes full-core `core_sha256` inline during buffered writes (`inline_write`) or via synced FD fallback (`post_sync_fd_read`).
-- **Production node safeguards**: Adds `--max-write-mbps 1..10000` bandwidth pacing, `POSIX_FADV_DONTNEED` page-cache eviction, `posix_fallocate` manifest space reservation, `RLIMIT_NOFILE`-aware pending FD budgeting, and boot-ID / 3600s stale OFD lock cleanup (`gc_stale_locks`).
+실행 파일 하나로 동작합니다. 수집 노드에 Rust, Python, GDB를 설치할 필요는 없습니다.
 
-## Run
+## 빠른 시작
 
-The release is one static Linux x86-64 executable. No GDB, glibc installation, container runtime CLI or adjacent files are required.
+### 1. 다운로드하고 확인하기
+
+수집할 Linux 노드에서 실행합니다. `manifest.json`은 배포 파일의 빌드 정보입니다. 뒤에서 만드는 수집 결과의 `manifest.json`과 저장 위치가 다릅니다.
 
 ```sh
+mkdir -p poddump_download
+cd poddump_download
+curl -fLO https://github.com/KKudroK/PodDump/releases/download/v0.5.0/poddump
+curl -fLO https://github.com/KKudroK/PodDump/releases/download/v0.5.0/manifest.json
+curl -fLO https://github.com/KKudroK/PodDump/releases/download/v0.5.0/SHA256SUMS.txt
+sha256sum -c SHA256SUMS.txt
 chmod 755 poddump
-sudo ./poddump --pod FULL_POD_UID --output /evidence/new_collection
-# Optional write bandwidth cap for busy production nodes
-sudo ./poddump --pod FULL_POD_UID --output /evidence/new_collection --max-write-mbps 200
+./poddump --version
 ```
 
-Production options: `--pod FULL_POD_UID` (or `--pod-uid`), `--output NEW_DIR`, `--request-id ID`, `--wait-timeout-ms 0..3600000` (default `60000`), `--max-write-mbps 1..10000`, `--format tree|json`, `--full-ids`. Use an existing output parent and a new collection directory. Run on the target node with its host proc/cgroup view and ptrace access. Output storage must support private permissions (`0o700`) and durable publication. [Supported environments and limits](docs/deployment.md).
+`sha256sum`의 두 결과가 모두 `OK`인지 확인합니다. SHA-256은 파일 내용이 바뀌었는지 비교하는 데 쓰는 값입니다.
 
-Historical output from a two-process test Pod on Ubuntu 24.04.5, using v0.3.1 (output-path lines omitted):
+### 2. Pod UID와 노드 확인하기
 
-```text
-PodDump 0.3.1
-Node: kkudrok-node  |  Scope: all_mapped_proc_mem  |  Durability: batch
-
-Pod: 1f4123ca-cbac-4c40-8085-77efc8ca5629
-├── Container: 2f7cf8919d5b…
-│   └── PID 77316   [OK]      77316_1235239.core
-└── Container: 55cf54e6f0ea…
-    └── PID 77281   [OK]      77281_1235229.core
-
-Result: COMPLETE  |  Processes: 2/2  |  Containers: 2  |  Elapsed: 0.235 s
-```
-
-[Full captured stdout (historical v0.3.1)](docs/examples/capture.stdout).
-
-## Tested environments (historical release matrix)
-
-The table below records tests of an earlier release binary; v0.5.0 A/B performance, `--no-pagemap-skip` SHA-256 equivalence, and `rrudrok` compatibility were verified on WSL2 `6.18.33.2` alongside offline unit tests (`81 passed`). Outside the Ubuntu Kubernetes row, Pod tests used synthetic cgroups. Debian, Rocky and Kali passed containerd/CRI-O/Docker path formats, which does not certify full installations of all three runtimes. [Test conditions](docs/distro_validation.md).
-
-| Environment | Kernel | Result |
-|---|---|---|
-| Ubuntu 24.04.5, Kubernetes/containerd | 6.8.0-147 | Real Pod capture on ext4 |
-| Ubuntu 26.04, WSL2 | 6.18.33.2 | Synthetic Pod capture on ext4 |
-| Debian 12 | 6.1.0-53-cloud-amd64 | Capture + pattern check; ext4, cgroup v2 |
-| Debian 13 | 6.12.111+deb13-cloud-amd64 | Capture + pattern check; ext4, cgroup v2 |
-| Rocky Linux 8.10 | 4.18.0-553.el8_10.x86_64 | Capture + pattern check; xfs, cgroup v1 |
-| Rocky Linux 9.8 | 5.14.0-687.10.1.el9_8.0.1.x86_64 | Capture + pattern check; xfs, cgroup v2 |
-| Kali Rolling (cloud 2026.2) | 6.18.12+kali-cloud-amd64 | Capture + pattern check; ext4, cgroup v2 |
-| Alpine 3.16.9, cgroup v1 | 5.15.148 | Synthetic Pod capture passed |
-| Alpine 3.22.6, cgroup v2 | 6.12.110 | Synthetic Pod capture passed |
-
-The Kali cloud archive is labelled 2026.2; its internal `VERSION_ID` is 2026.1.
-
-## Measured results (historical 2026-10-16 comparison)
-
-Historical Nginx comparison, 2026-10-16; one observation per condition. PodDump v7, ProcDump 3.5.3 with its gcore backend, and GDB with `--readnever`. Times below use wall time from the saved result files.
-
-| Pods | Processes | PodDump | ProcDump | GDB |
-|---:|---:|---:|---:|---:|
-| 1 | 6 | **0.228 s** | 0.520 s | 0.550 s |
-| 2 | 12 | **0.387 s** | 0.913 s | 1.022 s |
-| 4 | 24 | **0.691 s** | 1.743 s | 1.944 s |
-
-PodDump completed these multi-process Nginx captures in less time, though Redis cases were slower and collection policies/output sizes differ. [Results and source records](docs/benchmark_summary.md).
-
-## Requests and results
-
-- Different requests for the same Pod wait before discovery. `--wait-timeout-ms` defaults to 60000; zero rejects a busy Pod.
-- The same active `--request-id` returns the existing job's location with exit **3**, without starting another collection. After completion, another invocation is a new capture.
-- Exit **0**: complete under the recorded policy and persisted. **2**: partial. **1**: input/setup/persistence error. Preserve stderr and incomplete files.
-- Targets are stopped per process; a Pod capture is not atomic. SIGKILL can leave fragments without a final manifest.
-
-All cooperating collectors must share the same runtime directory and effective UID. Stop older versions before upgrading. [Coordination and recovery](docs/deployment.md#duplicate-requests-and-recapture).
-
-## Build and verify
+`kubectl`을 사용할 수 있는 곳에서 실행합니다. `default`와 `my-pod`는 실제 Namespace와 Pod 이름으로 바꾸세요.
 
 ```sh
-./poddump --version
-./poddump --build-info
+kubectl get pod -n default my-pod   -o jsonpath='{.metadata.uid}{"\n"}{.spec.nodeName}{"\n"}'
+```
+
+첫 줄은 Pod UID, 둘째 줄은 노드 이름입니다. Pod UID는 Pod를 구별하는 전체 값입니다. Pod 이름이나 UID의 일부를 수집 명령에 넣으면 안 됩니다. 이 확인 단계에만 `kubectl`이 필요합니다.
+
+### 3. 수집하기
+
+확인한 노드에서 실행합니다. `POD_UID`에 앞서 확인한 전체 값을 넣으세요. `/evidence` 대신 준비한 저장소 경로를 쓸 수 있습니다.
+
+```sh
+POD_UID='여기에-전체-Pod-UID'
+sudo install -d -m 700 /evidence
+sudo ./poddump --pod "$POD_UID" --output /evidence/pod_001
+result=$?
+printf '종료 코드: %s\n' "$result"
+```
+
+다음 수집에는 `pod_002`처럼 새 이름을 사용합니다. 이미 있는 결과 디렉터리를 덮어쓰지 않습니다.
+
+### 4. 결과 확인하기
+
+```sh
+sudo ls -lh /evidence/pod_001
+sudo cat /evidence/pod_001/manifest.json
+```
+
+`manifest.json`의 `status`와 각 `processes` 항목을 확인합니다. 화면의 완료 표시와 함께 **종료 코드가 0인지**도 확인해야 저장 완료를 판단할 수 있습니다.
+
+## 결과 확인
+
+| 파일 | 내용 |
+|---|---|
+| `PID_시작시각.core` | 해당 프로세스의 ELF Core. 메모리와 수집한 CPU 상태를 담습니다. |
+| `manifest.json` | Pod UID, 컨테이너 ID, 프로세스 식별 정보, 수집 범위, 실패 이유, Core의 SHA-256 값 |
+| `.partial` 파일 | 작업이 끝나지 않았거나 저장 중 문제가 생겨 남은 파일. 완료본으로 취급하지 않습니다. |
+
+| 종료 코드 | 뜻 | 다음 행동 |
+|---:|---|---|
+| `0` | 정해진 수집 정책에 따라 완료하고 저장을 마침 | `manifest.json`과 Core를 함께 보관합니다. |
+| `2` | 일부만 수집함 | 실패·제외·미수집 범위를 확인합니다. 남은 파일을 버리지 않습니다. |
+| `1` | 인자, 준비, 저장 등의 오류 | 터미널 오류와 남은 파일을 확인합니다. |
+| `3` | 같은 Pod UID와 같은 요청 ID의 작업이 이미 실행 중 | 출력된 기존 경로에서 원래 작업의 완료를 확인합니다. |
+
+## 옵션
+
+```sh
+./poddump --help
+```
+
+| 옵션 | 사용 방법 |
+|---|---|
+| `--pod FULL_POD_UID` | 필수. 전체 Pod UID. `--pod-uid`도 같은 뜻입니다. |
+| `--output NEW_DIR` | 필수. 새 결과 디렉터리 |
+| `--request-id ID` | 요청을 구별할 이름. 실행 중인 같은 요청을 다시 보내면 기존 작업을 안내합니다. 끝난 뒤 같은 ID로 실행하면 새로 수집합니다. |
+| `--wait-timeout-ms 0..3600000` | 같은 Pod의 앞선 작업을 기다리는 시간. 기본 60,000ms. `0`이면 기다리지 않습니다. |
+| `--max-write-mbps 1..10000` | 프로세스별 Core 쓰기 평균 속도 제한. `1`은 초당 1,000,000바이트입니다. 여러 프로세스를 동시에 쓰면 합계는 이 값보다 클 수 있습니다. |
+| `--format tree\|json` | 터미널 결과 형식. 기본은 `tree`입니다. |
+| `--full-ids` | 터미널에 전체 컨테이너 ID를 표시합니다. |
+| `--version`, `--build-info` | 버전 또는 빌드·실행 파일 정보를 확인합니다. |
+
+쓰기 속도 제한 예시입니다. 실제 쓰기는 묶어서 진행하므로 짧은 순간에는 설정값보다 빠를 수 있습니다. 큰 프로세스를 읽으며 바로 저장하는 경로에도 제한이 적용됩니다. 제한이 낮으면 수집 시간이 늘거나 프로세스 정지 시간 한도에 닿아 `partial`이 될 수 있습니다.
+
+```sh
+sudo ./poddump --pod "$POD_UID" --output /evidence/pod_002   --request-id case_001 --max-write-mbps 200
+```
+
+## 수집 범위와 주의할 점
+
+- 프로세스를 각각 잠깐 멈추고 읽은 뒤 다시 실행합니다. Pod 전체와 커널을 같은 순간에 수집한 결과는 아닙니다. 다른 프로세스가 공유 메모리를 바꿀 수도 있습니다.
+- 일반 메모리, 실행 코드, 스택 등을 수집합니다. `MADV_DONTDUMP`가 붙은 영역도 수집 대상에 남깁니다. 읽지 못한 바이트를 성공으로 표시하지 않습니다.
+- 안전 조건이 확인된 익명 메모리에서 아직 할당되지 않은 0 페이지의 읽기를 생략합니다. `pagemap`의 guard·userfaultfd 표시나 `smaps` 정보가 불확실하면 실제 읽기를 시도합니다. 장치 메모리 등 제외한 범위는 수집 기록에 남깁니다.
+- 0으로 채워진 파일 구간은 Sparse 방식으로 저장합니다. 읽을 때는 같은 0바이트가 나오지만 실제 디스크 사용량이 줄 수 있습니다. 저장소에 따라 절약되는 크기는 다릅니다.
+- 같은 Pod의 잠금 파일은 실행 중 자동 삭제하지 않습니다. 프로세스가 끝나면 Linux가 잠금을 해제합니다. 수집기가 실행 중일 때 잠금 파일을 수동으로 지우지 마세요.
+- Core에는 환경변수와 프로그램이 사용한 값이 원문으로 포함될 수 있습니다. 결과 디렉터리는 소유자만 접근하도록 만듭니다.
+
+프로세스 메모리와 커널을 함께 분석하려면 [KernelDump](https://github.com/KKudroK/KernelDump)의 결과와 해당 커널의 ISF도 준비합니다. ISF는 분석기가 커널 자료의 위치와 형식을 해석할 때 쓰는 파일입니다. PodDump 수집에는 필요하지 않습니다.
+
+## 빌드와 상세 문서
+
+소스에서 빌드할 때만 Rust와 Python 3가 필요합니다. 의존성 소스는 `vendor/`에 포함되어 있습니다.
+
+```sh
+rustup target add x86_64-unknown-linux-musl
 cargo test --offline --locked
-python3 scripts/build_release.py --check-vendor
 python3 scripts/build_release.py
 ```
 
-Version **0.5.0**. The build script tests and emits `release/poddump` and a hash receipt. The receipt is optional at runtime. [Codebase guide (KO)](docs/CODEBASE_GUIDE.md) · [Development options](docs/development_options.md) · [v0.4.0 notes](docs/release_v0_4_0.md) · [Release checks](docs/release_validation.md) · [Earlier documentation](docs/history_readme_20261017_en.md).
+결과는 `release/poddump`, `release/manifest.json`, `release/SHA256SUMS.txt`입니다. 공개 빌드에는 `development-options`를 켜지 않습니다.
 
-MIT license. Core-file code derives from Microsoft ProcDump for Linux; see [NOTICE.txt](NOTICE.txt).
+- [코드와 수집 원리](docs/CODEBASE_GUIDE.md)
+- [배포 조건](docs/deployment.md)
+- [배포판별 과거 검증](docs/distro_validation.md)
+- [과거 성능 측정](docs/benchmark_summary.md)
+
+MIT 라이선스입니다. 포함된 외부 의존성에는 각 프로젝트의 라이선스가 적용됩니다.

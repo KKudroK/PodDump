@@ -1,33 +1,17 @@
-# Standalone deployment — 2026-10-17
+# 배포 조건
 
-The executable is `poddump` (0.3.1), a static PIE for Linux x86-64. Copy this one file to the node and make it executable. Rust, Python, glibc, GDB, kubectl, container runtime CLIs, a sidecar, and adjacent metadata files are not runtime dependencies. `scripts/build_release.py` and `vendor/` are for build hosts only.
+현재 실행 조건과 명령은 [한국어 README](../README.md)에 있습니다. 공개 파일은 Linux x86-64 정적 바이너리입니다. 분석 입력이나 결과의 완전성은 수집 상태·오류·검사 범위를 함께 확인해야 합니다.
 
-```sh
-chmod 755 poddump
-./poddump --version
-./poddump --build-info
-sudo ./poddump --pod FULL_POD_UID --output /evidence/new_collection --request-id incident_001
-```
+## 노드 준비
 
-## Supported deployment boundary
+노드의 호스트 proc·cgroup을 사용하고, 수집 대상 읽기 권한을 확보합니다. 실행 파일만 복사한다고 필요한 권한이 생기지는 않습니다. 저장소는 소유자 전용 권한, 독점 파일 생성, `renameat2(RENAME_NOREPLACE)`, 파일·디렉터리 `fsync`를 지원해야 합니다. 출력 부모 디렉터리를 먼저 만들고 수집마다 새 경로를 사용합니다.
 
-- This release targets x86-64 only. The [README](../README.md#tested-environments) lists the tested distribution/kernel pairs; the [additional VM matrix](distro_validation.md) records Debian 12/13, Rocky 8/9 and Kali. Synthetic cgroup tests and actual Ubuntu Kubernetes/containerd integration are distinguished. ARM64 and arbitrary cloud distributions are not certified by these results.
-- Run against the host's PID/proc/cgroup view with permission to ptrace every selected process. Copying the binary cannot grant kernel capabilities or bypass Yama, SELinux, AppArmor, seccomp, or namespace restrictions. No security settings are changed.
-- The output parent must already exist. Use persistent Linux storage supporting private directory/file modes, exclusive creation, `renameat2(RENAME_NOREPLACE)`, and file/directory `fsync`. Local ext4 was exercised. Network filesystems are not qualified by this test. tmpfs was used only for bounded failure tests; it is volatile even when fsync returns success.
-- A writable private runtime directory is needed for node credits and Pod locks. It is created automatically; no daemon/configuration file is required. All cooperating invocations must use the same effective UID and runtime directory in a shared mount view. `PODDUMP_RUNTIME_DIR` selects a common path when needed. Do not remove/replace active lock files. Stop all older collectors before upgrading: older binaries do not participate in Pod admission.
+ext4에서 검사합니다. 네트워크 파일 시스템이나 WSL의 Windows 공유 경로가 같은 조건을 제공한다고 가정하지 않습니다. tmpfs는 재부팅 후 저장을 보장하지 않습니다. SIGKILL이나 저장 오류 뒤에 남은 파일은 완료본으로 취급하지 않습니다.
 
-## Duplicate requests and recapture
+## 배포 파일 확인
 
-One collection at a time is admitted for each Pod UID. A different active request waits before discovery, without attaching or stopping targets; after admission it discovers current PID/start-time/cgroup identities again. The default wait limit is 60 seconds, adjustable with `--wait-timeout-ms 0..3600000`; zero rejects a busy Pod immediately. SIGINT/SIGTERM cancels admission. OFD locks are released by the kernel on exit, including SIGKILL.
+다운로드한 실행 파일, 배포 `manifest.json`, `SHA256SUMS.txt`를 같은 폴더에 놓고 `sha256sum -c SHA256SUMS.txt`를 실행합니다. `--build-info`의 `source_sha256`, `vendor_tree_sha256`, target, features, compiler도 확인할 수 있습니다. 실행 파일의 해시는 실제 `/proc/self/exe`를 읽어 계산합니다.
 
-An invocation with the same Pod UID and **same active `--request-id`** returns JSON containing `status: already_running`, the active request and its output path, and exits **3**. It does not create the requested output or claim that evidence is complete. Follow the original job's exit status and manifest. This is active-request coalescing, not a persistent incident cache: invoking after the prior job has finished starts a fresh observation, even with the same label. Use a fresh request ID for a different observation time.
+소스 빌드는 Rust와 `x86_64-unknown-linux-musl` target, Python 3가 필요합니다. `python3 scripts/build_release.py`는 오프라인 빌드·테스트를 실행하고 외부 공유 라이브러리와 개발 옵션이 없는지 확인합니다. 배포 빌드에 CPU 전용 최적화 플래그를 넣지 않습니다.
 
-Exit 0 means successful completion and publication under the recorded collection policy; exit 2 means partial collection; exit 1 means invalid input, setup or final persistence failure. Preserve stderr. A hard kill can leave fragments without a final manifest; these are incomplete evidence. Per-process stopping, bounded streaming, non-atomic Pod snapshots, externally changing shared mappings, and cooperative kernel-I/O cancellation remain limitations. Runtime budgets are not a total host RSS/Dirty/space guarantee.
-
-## Build identity and rebuilding
-
-`--build-info` and collection manifests contain automatically generated source SHA-256 values, a vendored-tree digest, actual features, target and compiler. `runtime_executable_sha256` hashes `/proc/self/exe` on that invocation. The binary never embeds a claimed hash of itself. `release/manifest.json` records the independently computed final file hash; neither that file nor source metadata is needed to execute the binary. Rehash after stripping or otherwise modifying a binary.
-
-With Rust 1.90.0 and its `x86_64-unknown-linux-musl` standard library already installed, run `python3 scripts/build_release.py`. It builds/tests offline, rejects dynamic dependencies and development features, and emits the binary plus a receipt. Use the generic x86-64 target, not host-specific CPU flags, for distribution. Build-host Python is not a deployment dependency.
-
-The 2026-10-17 qualification is stability and deployability work. Earlier benchmark tables are historical measurements, not current performance, cloud-wide compatibility, exhaustive memory coverage or service-availability guarantees.
+[이전 배포 검증 기록](history_deployment_previous.md)과 [배포판별 과거 검사](distro_validation.md)는 각 문서의 빌드·환경에 한정됩니다.

@@ -66,7 +66,7 @@ pub(crate) fn estimate(id: &crate::identity::Identity, uid: &str) -> Result<usiz
         .iter()
         .filter(|m| m.should_dump)
         .try_fold(
-            1024 * 1024usize + elf::header_reserve_bytes_for(dumped_count),
+            1024 * 1024usize + elf::header_reserve_bytes_for(dumped_count, payload as u64),
             |n, m| n.checked_add(m.path.len() + 128),
         )
         .ok_or("metadata overflow")?
@@ -304,7 +304,7 @@ pub(crate) fn capture_with_options(
                 .sum();
             let required = bytes
                 .checked_add(
-                    notes.len() as u64 + elf::header_reserve_bytes_for(dumped_count) as u64,
+                    notes.len() as u64 + elf::header_reserve_bytes_for(dumped_count, bytes) as u64,
                 )
                 .ok_or_else(|| CorexError::InvalidData("snapshot size overflow".into()))?;
             if required > output_limit as u64 {
@@ -346,7 +346,7 @@ pub(crate) fn capture_with_options(
                 } else {
                     io_stats = elf::write_reserved(
                         path,
-                        elf::SparseWriter { file: &mut output },
+                        elf::SparseWriter::new(&mut output, options.max_write_mbps),
                         &process,
                         &notes,
                         Some(cancellation),
@@ -453,8 +453,7 @@ impl Captured {
             let mut hasher = Sha256::new();
             let mut offset = 0usize;
             let mut cached_block: Option<(usize, usize, bool)> = None;
-            let rate_begin = std::time::Instant::now();
-            let max_bps = self.max_write_mbps.map(|m| m as f64 * 1_000_000.0);
+            let mut rate = crate::rate_limit::RateLimiter::new(self.max_write_mbps);
             let feed_zero_hash = |hasher: &mut Sha256, mut len: usize| {
                 while len > 0 {
                     let step = len.min(HASH_ZERO_SLICE.len());
@@ -580,14 +579,12 @@ impl Captured {
                                 short_writes += u64::from(n < remaining.len());
                                 written_bytes += n;
                                 remaining = &remaining[n..];
-                                if let Some(bps) = max_bps {
-                                    let expected = written_bytes as f64 / bps;
-                                    let elapsed = rate_begin.elapsed().as_secs_f64();
-                                    if expected > elapsed {
-                                        std::thread::sleep(std::time::Duration::from_secs_f64(
-                                            (expected - elapsed).min(0.25),
-                                        ));
-                                    }
+                                if !rate.account(n, || cancellation.is_cancelled()) {
+                                    return Err(if cancellation.timed_out() {
+                                        CorexError::TimedOut
+                                    } else {
+                                        CorexError::Cancelled
+                                    });
                                 }
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -858,7 +855,7 @@ mod deadline_regressions {
 
     #[test]
     fn header_reserve_scales_with_dumped_mapping_count() {
-        assert!(elf::header_reserve_bytes_for(10) <= 16_384);
-        assert!(elf::header_reserve_bytes_for(70_000) > elf::header_reserve_bytes_for(10));
+        assert!(elf::header_reserve_bytes_for(10, 0) <= 16_384);
+        assert!(elf::header_reserve_bytes_for(70_000, 0) > elf::header_reserve_bytes_for(10, 0));
     }
 }

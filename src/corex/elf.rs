@@ -16,23 +16,25 @@ const PT_NOTE: u32 = 4;
 const MAX_PHDRS: usize = 524_288;
 const MIN_PHDR_SLACK: usize = 64;
 const MAX_PHDR_SLACK: usize = 1024;
-const PM_NONZERO_BITS: u64 = (1 << 63) | (1 << 62) | (1 << 61);
+// Guard/userfaultfd markers are not demand-zero pages, even when non-present.
+const PM_NONZERO_BITS: u64 = (1 << 63) | (1 << 62) | (1 << 61) | (1 << 58) | (1 << 57);
 
-fn phdr_capacity_for(dumped_mappings: usize) -> Result<usize, CorexError> {
+fn phdr_capacity_for(dumped_mappings: usize, mapped_bytes: u64) -> Result<usize, CorexError> {
+    if dumped_mappings >= MAX_PHDRS {
+        return Err(CorexError::InvalidData(
+            "too many mapped regions for ELF headers".into(),
+        ));
+    }
+    // One failed page can split readable bytes into another PT_LOAD. Reserve
+    // for alternating readable/unreadable pages, not only the VMA count.
+    // The unused header area is sparse; the global ledger limit remains explicit.
+    let runs = dumped_mappings.saturating_add((mapped_bytes / 4096).div_ceil(2) as usize);
     let slack = dumped_mappings.clamp(MIN_PHDR_SLACK, MAX_PHDR_SLACK);
-    dumped_mappings
-        .checked_add(1 + slack)
-        .filter(|n| *n <= MAX_PHDRS)
-        .ok_or_else(|| {
-            CorexError::InvalidData(format!(
-                "ELF program-header count exceeds maximum supported runs ({MAX_PHDRS})"
-            ))
-        })
+    Ok(runs.saturating_add(1 + slack).min(MAX_PHDRS))
 }
 
-pub(super) fn header_reserve_bytes_for(dumped_mappings: usize) -> usize {
-    let slots =
-        dumped_mappings.saturating_add(1 + dumped_mappings.clamp(MIN_PHDR_SLACK, MAX_PHDR_SLACK));
+pub(super) fn header_reserve_bytes_for(dumped_mappings: usize, mapped_bytes: u64) -> usize {
+    let slots = phdr_capacity_for(dumped_mappings, mapped_bytes).unwrap_or(MAX_PHDRS);
     (ELF_HEADER_SIZE as usize)
         .saturating_add(slots.saturating_mul(PROGRAM_HEADER_SIZE as usize))
         .saturating_add(ELF_SECTION_HEADER_SIZE as usize)
@@ -482,14 +484,34 @@ impl Drop for Snapshot {
 }
 pub(super) trait CoreSink: Write + Seek {
     fn write_zero_bytes(&mut self, len: u64) -> std::io::Result<()>;
+    fn throttle(
+        &mut self,
+        _c: Option<&crate::engine::CancellationToken>,
+        _alive: &dyn Fn() -> Result<(), CorexError>,
+    ) -> Result<(), CorexError> {
+        Ok(())
+    }
 }
 pub(super) struct SparseWriter<'a> {
     pub file: &'a mut File,
+    rate: crate::rate_limit::RateLimiter,
+    pending_written: usize,
+}
+impl<'a> SparseWriter<'a> {
+    pub fn new(file: &'a mut File, mbps: Option<u64>) -> Self {
+        Self {
+            file,
+            rate: crate::rate_limit::RateLimiter::new(mbps),
+            pending_written: 0,
+        }
+    }
 }
 impl Write for SparseWriter<'_> {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         if data.len() < SPARSE_PAGE_BYTES {
-            return self.file.write(data);
+            let n = self.file.write(data)?;
+            self.pending_written += n;
+            return Ok(n);
         }
         let mut pos = 0usize;
         while pos + SPARSE_PAGE_BYTES <= data.len() {
@@ -517,6 +539,7 @@ impl Write for SparseWriter<'_> {
                     }
                     Ok(n) => {
                         pos += n;
+                        self.pending_written += n;
                         if n < data_end - (pos - n) {
                             return Ok(pos);
                         }
@@ -527,7 +550,10 @@ impl Write for SparseWriter<'_> {
         }
         if pos < data.len() {
             match self.file.write(&data[pos..]) {
-                Ok(n) => pos += n,
+                Ok(n) => {
+                    pos += n;
+                    self.pending_written += n;
+                }
                 Err(e) => return if pos > 0 { Ok(pos) } else { Err(e) },
             }
         }
@@ -545,6 +571,21 @@ impl Seek for SparseWriter<'_> {
     }
 }
 impl CoreSink for SparseWriter<'_> {
+    fn throttle(
+        &mut self,
+        c: Option<&crate::engine::CancellationToken>,
+        alive: &dyn Fn() -> Result<(), CorexError>,
+    ) -> Result<(), CorexError> {
+        let n = std::mem::take(&mut self.pending_written);
+        if !self.rate.account(n, || {
+            c.is_some_and(crate::engine::CancellationToken::is_cancelled) || alive().is_err()
+        }) {
+            check_cancelled(c)?;
+            alive()?;
+            return Err(CorexError::Cancelled);
+        }
+        Ok(())
+    }
     fn write_zero_bytes(&mut self, len: u64) -> std::io::Result<()> {
         self.file.seek(SeekFrom::Current(len as i64)).map(|_| ())
     }
@@ -563,6 +604,13 @@ impl CoreSink for std::io::Cursor<Vec<u8>> {
     }
 }
 impl<T: CoreSink + ?Sized> CoreSink for &mut T {
+    fn throttle(
+        &mut self,
+        c: Option<&crate::engine::CancellationToken>,
+        alive: &dyn Fn() -> Result<(), CorexError>,
+    ) -> Result<(), CorexError> {
+        (**self).throttle(c, alive)
+    }
     fn write_zero_bytes(&mut self, len: u64) -> std::io::Result<()> {
         (**self).write_zero_bytes(len)
     }
@@ -576,7 +624,11 @@ struct Layout {
 }
 fn layout(process: &ProcessInfo, notes: &[u8]) -> Result<Layout, CorexError> {
     let dumped: Vec<_> = process.mappings.iter().filter(|m| m.should_dump).collect();
-    let phdr_slots = phdr_capacity_for(dumped.len())?;
+    let mapped_bytes = dumped
+        .iter()
+        .try_fold(0u64, |sum, m| sum.checked_add(m.end - m.start))
+        .ok_or_else(|| CorexError::InvalidData("mapping size overflow".into()))?;
+    let phdr_slots = phdr_capacity_for(dumped.len(), mapped_bytes)?;
     validate_mappings(process, &dumped)?;
     let shoff = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * (phdr_slots as u64);
     let note = shoff + ELF_SECTION_HEADER_SIZE;
@@ -1032,7 +1084,8 @@ pub(super) fn write_reserved<W: CoreSink>(
                     };
                     writes += 1;
                     elapsed += crate::now() - begin;
-                    result
+                    result?;
+                    output.throttle(c, alive)
                 },
             );
             stats.write_calls += writes;
@@ -1227,9 +1280,7 @@ mod tests {
         let mut scratch = vec![0; MEMORY_CHUNK_SIZE];
         let stats = write_reserved(
             Path::new("memfd_pn_xnum"),
-            SparseWriter {
-                file: &mut out_file,
-            },
+            SparseWriter::new(&mut out_file, None),
             &process,
             &[],
             None,
@@ -1332,7 +1383,7 @@ mod tests {
         assert!(fd >= 0);
         let mut file = unsafe { File::from_raw_fd(fd) };
         {
-            let mut writer = SparseWriter { file: &mut file };
+            let mut writer = SparseWriter::new(&mut file, None);
             writer.write_all(&[0x41; 4096]).unwrap();
             writer.write_all(&[0; 8192]).unwrap();
             writer.flush().unwrap();
@@ -1484,7 +1535,7 @@ mod maximum_coverage_regressions {
         let mut scratch = vec![0; MEMORY_CHUNK_SIZE];
         let stats = write_reserved(
             Path::new("memfd"),
-            SparseWriter { file: &mut out },
+            SparseWriter::new(&mut out, None),
             &process,
             &[],
             None,
@@ -1873,7 +1924,7 @@ mod maximum_coverage_regressions {
         payload[4096 * 3..4096 * 4].fill(0x22);
         // pages 4..6 trailing zero hole (8 KiB)
         {
-            let mut writer = SparseWriter { file: &mut out };
+            let mut writer = SparseWriter::new(&mut out, None);
             writer.write_all(&payload).unwrap();
             writer.flush().unwrap();
         }
@@ -1888,5 +1939,61 @@ mod maximum_coverage_regressions {
         let mut actual = vec![0u8; payload.len()];
         out.read_exact_at(&mut actual, 0).unwrap();
         assert_eq!(actual, payload);
+    }
+    #[test]
+    fn streaming_rate_limit_counts_data_but_not_sparse_holes() {
+        let path = std::env::temp_dir().join(format!(
+            "poddump_rate_{}_{}",
+            std::process::id(),
+            crate::now()
+        ));
+        let mut file = File::create(&path).unwrap();
+        let mut writer = SparseWriter::new(&mut file, Some(1));
+        let start = std::time::Instant::now();
+        writer.write_all(&vec![0x5a; 350_000]).unwrap();
+        assert_eq!(writer.pending_written, 350_000);
+        writer.throttle(None, &|| Ok(())).unwrap();
+        assert!(start.elapsed() >= std::time::Duration::from_millis(350));
+        writer.write_zero_bytes(16 * 1024 * 1024).unwrap();
+        assert_eq!(writer.pending_written, 0);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn fragmented_mapping_retains_more_than_old_header_slack() {
+        let mut process = tests::process();
+        process.mappings.truncate(1);
+        process.mappings[0].start = 0x1000;
+        process.mappings[0].end = 0x1000 + 1024 * 4096;
+        let l = layout(&process, &[]).unwrap();
+        let mut coverage = Coverage::reserve().unwrap();
+        for i in 0..512 {
+            coverage.spans.push(ReadSpan {
+                start: 0x1000 + i * 8192,
+                end: 0x2000 + i * 8192,
+                file_offset: l.first + i * 8192,
+                flags: 4,
+                mapping_index: 0,
+            });
+        }
+        assert!(headers(&process, &[], &l, &coverage).is_ok());
+    }
+
+    #[test]
+    fn pagemap_guard_and_userfaultfd_markers_are_not_zero_runs() {
+        let path = std::env::temp_dir().join(format!(
+            "poddump_pm_marker_{}_{}",
+            std::process::id(),
+            crate::now()
+        ));
+        for marker in [1u64 << 58, 1u64 << 57, 1u64 << 62, 1u64 << 63] {
+            std::fs::write(&path, marker.to_le_bytes()).unwrap();
+            let file = File::open(&path).unwrap();
+            assert!(matches!(
+                next_pagemap_step(&file, 0, 4096, 4096, 4096),
+                Some(PagemapStep::ReadRun(4096))
+            ));
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

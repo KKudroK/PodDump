@@ -105,7 +105,7 @@ fn apply_smaps_inspection(mappings: &mut [Mapping], smaps: &str) {
     let mut current_rss: Option<u64> = None;
     let mut current_swap: Option<u64> = None;
     let mut current_device_or_pfn = false;
-    let mut current_disallow_pagemap_skip = false;
+    let mut current_disallow_pagemap_skip = true;
     let mut map_cursor = 0usize;
 
     let mut apply = |range: Option<(u64, u64)>,
@@ -141,7 +141,11 @@ fn apply_smaps_inspection(mappings: &mut [Mapping], smaps: &str) {
         if device_or_pfn {
             m.should_dump = false;
             m.exclusion_reason = Some("device_io_or_pfnmap");
-        } else if is_anon_prot_none(m) && rss_kb == Some(0) && swap_kb == Some(0) {
+        } else if is_anon_prot_none(m)
+            && !disallow_pagemap_skip
+            && rss_kb == Some(0)
+            && swap_kb == Some(0)
+        {
             m.should_dump = false;
             m.exclusion_reason = Some("uncommitted_anonymous_prot_none");
         }
@@ -168,7 +172,7 @@ fn apply_smaps_inspection(mappings: &mut [Mapping], smaps: &str) {
             current_rss = None;
             current_swap = None;
             current_device_or_pfn = false;
-            current_disallow_pagemap_skip = false;
+            current_disallow_pagemap_skip = true;
             continue;
         }
         if current_range.is_some() {
@@ -183,6 +187,7 @@ fn apply_smaps_inspection(mappings: &mut [Mapping], smaps: &str) {
                     .next()
                     .and_then(|v| v.parse::<u64>().ok());
             } else if let Some(rest) = line.strip_prefix("VmFlags:") {
+                current_disallow_pagemap_skip = rest.trim().is_empty();
                 for flag in rest.split_whitespace() {
                     if matches!(flag, "io" | "pf") {
                         current_device_or_pfn = true;
@@ -274,7 +279,7 @@ fn parse_mapping(line: &[u8]) -> Option<Mapping> {
         is_file_backed: inode > 0,
         should_dump,
         exclusion_reason: kernel_special.then_some("kernel_special_unreadable"),
-        vm_flags_disallow_pagemap_skip: false,
+        vm_flags_disallow_pagemap_skip: true,
         rss_bytes: None,
         swap_bytes: None,
         path,
@@ -532,5 +537,17 @@ VmFlags: rd wr mr mw me ht\n";
         let mut mappings = vec![mapping];
         disambiguate_map_files(9999999, &mut mappings);
         assert_eq!(mappings[0].raw_path, b"/tmp/test\\012file");
+    }
+    #[test]
+    fn missing_vmflags_and_hugetlb_prot_none_never_authorize_zero_omission() {
+        for flags in ["", "VmFlags: ht mr mw me\n", "VmFlags: sh mr mw me\n"] {
+            let mut maps = vec![parse_mapping(b"1000-2000 ---p 00000000 00:00 0").unwrap()];
+            apply_smaps_inspection(
+                &mut maps,
+                &format!("1000-2000 ---p 00000000 00:00 0\nRss: 0 kB\nSwap: 0 kB\n{flags}"),
+            );
+            assert!(maps[0].should_dump);
+            assert!(maps[0].vm_flags_disallow_pagemap_skip);
+        }
     }
 }
