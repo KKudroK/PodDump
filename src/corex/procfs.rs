@@ -43,25 +43,23 @@ pub(super) fn read_process(pid: i32) -> Result<ProcessInfo, CorexError> {
         exe: fs::read_link(format!("/proc/{pid}/exe"))
             .map(|path| path.to_string_lossy().into_owned())
             .map_err(|e| CorexError::io("read executable symlink", pid.to_string(), e))?,
-        cmdline: read_limited(format!("/proc/{pid}/cmdline"), 4096)?,
+        cmdline: read_limited(format!("/proc/{pid}/cmdline"), 131_072)?,
         mappings: read_maps(pid)?,
-        auxv: read_limited(format!("/proc/{pid}/auxv"), 4096)?,
+        auxv: read_limited(format!("/proc/{pid}/auxv"), 65_536)?,
         coredump_filter: read_coredump_filter(pid),
         page_size: page_size()?,
         tids: enumerate_threads(pid)?,
     })
 }
 
-const UNCOMMITTED_PROT_NONE_MIN_BYTES: u64 = 16 * 1024 * 1024;
-
-fn is_large_anon_prot_none(m: &Mapping) -> bool {
+fn is_anon_prot_none(m: &Mapping) -> bool {
     m.flags == 0
         && !m.is_file_backed
         && !matches!(
             m.path.as_str(),
             "[vvar]" | "[vdso]" | "[vsyscall]" | "[vectors]"
         )
-        && m.end.saturating_sub(m.start) >= UNCOMMITTED_PROT_NONE_MIN_BYTES
+        && !m.path.starts_with("[vvar")
 }
 
 fn read_maps(pid: i32) -> Result<Vec<Mapping>, CorexError> {
@@ -79,11 +77,9 @@ fn read_maps(pid: i32) -> Result<Vec<Mapping>, CorexError> {
         );
     }
     disambiguate_map_files(pid, &mut mappings);
-    if mappings.iter().any(is_large_anon_prot_none) {
-        if let Ok(smaps_raw) = fs::read(format!("/proc/{pid}/smaps")) {
-            let smaps_contents = String::from_utf8_lossy(&smaps_raw);
-            filter_uncommitted_prot_none(&mut mappings, &smaps_contents);
-        }
+    if let Ok(smaps_raw) = fs::read(format!("/proc/{pid}/smaps")) {
+        let smaps_contents = String::from_utf8_lossy(&smaps_raw);
+        apply_smaps_inspection(&mut mappings, &smaps_contents);
     }
     Ok(mappings)
 }
@@ -104,36 +100,76 @@ fn disambiguate_map_files(pid: i32, mappings: &mut [Mapping]) {
     }
 }
 
-fn filter_uncommitted_prot_none(mappings: &mut [Mapping], smaps: &str) {
+fn apply_smaps_inspection(mappings: &mut [Mapping], smaps: &str) {
     let mut current_range: Option<(u64, u64)> = None;
     let mut current_rss: Option<u64> = None;
     let mut current_swap: Option<u64> = None;
-    let mut apply = |range: Option<(u64, u64)>, rss: Option<u64>, swap: Option<u64>| {
-        if let (Some((start, end)), Some(0), Some(0)) = (range, rss, swap) {
-            if let Some(m) = mappings
-                .iter_mut()
-                .find(|m| m.start == start && m.end == end && is_large_anon_prot_none(m))
-            {
-                m.should_dump = false;
-            }
+    let mut current_device_or_pfn = false;
+    let mut current_disallow_pagemap_skip = false;
+    let mut map_cursor = 0usize;
+
+    let mut apply = |range: Option<(u64, u64)>,
+                     rss_kb: Option<u64>,
+                     swap_kb: Option<u64>,
+                     device_or_pfn: bool,
+                     disallow_pagemap_skip: bool| {
+        let Some((start, end)) = range else {
+            return;
+        };
+        let pos = mappings[map_cursor..]
+            .iter()
+            .position(|m| m.start == start && m.end == end)
+            .map(|offset| map_cursor + offset)
+            .or_else(|| {
+                mappings
+                    .iter()
+                    .position(|m| m.start == start && m.end == end)
+            });
+        let Some(idx) = pos else {
+            return;
+        };
+        if idx >= map_cursor {
+            map_cursor = idx + 1;
+        }
+        let m = &mut mappings[idx];
+        m.rss_bytes = rss_kb.map(|kb| kb.saturating_mul(1024));
+        m.swap_bytes = swap_kb.map(|kb| kb.saturating_mul(1024));
+        m.vm_flags_disallow_pagemap_skip = disallow_pagemap_skip;
+        if !m.should_dump {
+            return;
+        }
+        if device_or_pfn {
+            m.should_dump = false;
+            m.exclusion_reason = Some("device_io_or_pfnmap");
+        } else if is_anon_prot_none(m) && rss_kb == Some(0) && swap_kb == Some(0) {
+            m.should_dump = false;
+            m.exclusion_reason = Some("uncommitted_anonymous_prot_none");
         }
     };
+
     for line in smaps.lines() {
-        if line.contains('-') && line.as_bytes().first().is_some_and(u8::is_ascii_hexdigit) {
-            if let Some((start_str, rest)) = line.split_once('-') {
-                if let Some((end_str, _)) = rest.split_once(' ') {
-                    if let (Ok(start), Ok(end)) = (
-                        u64::from_str_radix(start_str, 16),
-                        u64::from_str_radix(end_str, 16),
-                    ) {
-                        apply(current_range, current_rss, current_swap);
-                        current_range = Some((start, end));
-                        current_rss = None;
-                        current_swap = None;
-                        continue;
-                    }
-                }
-            }
+        if line.contains('-')
+            && line.as_bytes().first().is_some_and(u8::is_ascii_hexdigit)
+            && let Some((start_str, rest)) = line.split_once('-')
+            && let Some((end_str, _)) = rest.split_once(' ')
+            && let (Ok(start), Ok(end)) = (
+                u64::from_str_radix(start_str, 16),
+                u64::from_str_radix(end_str, 16),
+            )
+        {
+            apply(
+                current_range,
+                current_rss,
+                current_swap,
+                current_device_or_pfn,
+                current_disallow_pagemap_skip,
+            );
+            current_range = Some((start, end));
+            current_rss = None;
+            current_swap = None;
+            current_device_or_pfn = false;
+            current_disallow_pagemap_skip = false;
+            continue;
         }
         if current_range.is_some() {
             if let Some(rest) = line.strip_prefix("Rss:") {
@@ -146,10 +182,27 @@ fn filter_uncommitted_prot_none(mappings: &mut [Mapping], smaps: &str) {
                     .split_whitespace()
                     .next()
                     .and_then(|v| v.parse::<u64>().ok());
+            } else if let Some(rest) = line.strip_prefix("VmFlags:") {
+                for flag in rest.split_whitespace() {
+                    if matches!(flag, "io" | "pf") {
+                        current_device_or_pfn = true;
+                        current_disallow_pagemap_skip = true;
+                    } else if matches!(flag, "ht" | "mm" | "sh" | "ui" | "uw" | "up") {
+                        // Do NOT treat VM_DONTDUMP ("dd") as an exclusion: anti-forensic
+                        // MADV_DONTDUMP regions remain within all_mapped_proc_mem policy.
+                        current_disallow_pagemap_skip = true;
+                    }
+                }
             }
         }
     }
-    apply(current_range, current_rss, current_swap);
+    apply(
+        current_range,
+        current_rss,
+        current_swap,
+        current_device_or_pfn,
+        current_disallow_pagemap_skip,
+    );
 }
 
 fn parse_mapping(line: &[u8]) -> Option<Mapping> {
@@ -210,7 +263,8 @@ fn parse_mapping(line: &[u8]) -> Option<Mapping> {
     if permissions.get(2) == Some(&b'x') {
         flags |= PF_X;
     }
-    let should_dump = !is_kernel_special_unreadable(&path);
+    let kernel_special = is_kernel_special_unreadable(&path);
+    let should_dump = !kernel_special;
     Some(Mapping {
         start,
         end,
@@ -219,6 +273,10 @@ fn parse_mapping(line: &[u8]) -> Option<Mapping> {
         is_shared: permissions.get(3) == Some(&b's'),
         is_file_backed: inode > 0,
         should_dump,
+        exclusion_reason: kernel_special.then_some("kernel_special_unreadable"),
+        vm_flags_disallow_pagemap_skip: false,
+        rss_bytes: None,
+        swap_bytes: None,
         path,
         raw_path,
     })
@@ -350,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn uncommitted_large_prot_none_requires_zero_rss_and_zero_swap() {
+    fn uncommitted_prot_none_of_any_size_requires_zero_rss_and_zero_swap() {
         let mut mappings = vec![
             parse_mapping(
                 b"000000c000000000-000000c004000000 ---p 00000000 00:00 0 [anon: Go: heap reservation]",
@@ -365,23 +423,77 @@ mod tests {
 Size:              65536 kB\n\
 Rss:                   0 kB\n\
 Swap:                  0 kB\n\
+VmFlags: mr mw me ac sd\n\
 000000c004000000-000000c008000000 ---p 00000000 00:00 0 \n\
 Size:              65536 kB\n\
 Rss:                   0 kB\n\
 Swap:                  4 kB\n\
+VmFlags: mr mw me ac sd\n\
 000000c008000000-000000c00c000000 ---p 00000000 00:00 0 \n\
 Size:              65536 kB\n\
 Rss:                   4 kB\n\
 Swap:                  0 kB\n\
+VmFlags: mr mw me ac sd\n\
 00007f0000000000-00007f0000001000 ---p 00000000 00:00 0 \n\
 Size:                  4 kB\n\
 Rss:                   0 kB\n\
-Swap:                  0 kB\n";
-        filter_uncommitted_prot_none(&mut mappings, smaps);
+Swap:                  0 kB\n\
+VmFlags: mr mw me ac sd\n";
+        apply_smaps_inspection(&mut mappings, smaps);
         assert!(!mappings[0].should_dump);
+        assert_eq!(
+            mappings[0].exclusion_reason,
+            Some("uncommitted_anonymous_prot_none")
+        );
         assert!(mappings[1].should_dump);
         assert!(mappings[2].should_dump);
+        assert!(!mappings[3].should_dump);
+        assert_eq!(
+            mappings[3].exclusion_reason,
+            Some("uncommitted_anonymous_prot_none")
+        );
+    }
+
+    #[test]
+    fn smaps_excludes_vm_io_and_pfnmap_while_retaining_vm_dontdump() {
+        let mut mappings = vec![
+            parse_mapping(b"1000-2000 rw-s 00000000 00:06 10 /dev/zero").unwrap(),
+            parse_mapping(b"3000-4000 rw-p 00000000 00:00 0").unwrap(),
+            parse_mapping(b"5000-6000 rw-p 00000000 00:00 0").unwrap(),
+            parse_mapping(b"7000-8000 rw-p 00000000 00:00 0").unwrap(),
+        ];
+        let smaps = "\
+00001000-00002000 rw-s 00000000 00:06 10 /dev/zero\n\
+Rss:                  4 kB\n\
+Swap:                 0 kB\n\
+VmFlags: rd wr sh mr mw me io\n\
+00003000-00004000 rw-p 00000000 00:00 0\n\
+Rss:                  4 kB\n\
+Swap:                 0 kB\n\
+VmFlags: rd wr mr mw me pf\n\
+00005000-00006000 rw-p 00000000 00:00 0\n\
+Rss:                  4 kB\n\
+Swap:                 0 kB\n\
+VmFlags: rd wr mr mw me dd ac\n\
+00007000-00008000 rw-p 00000000 00:00 0\n\
+Rss:                  4 kB\n\
+Swap:                 0 kB\n\
+VmFlags: rd wr mr mw me ht\n";
+        apply_smaps_inspection(&mut mappings, smaps);
+        assert!(!mappings[0].should_dump);
+        assert_eq!(mappings[0].exclusion_reason, Some("device_io_or_pfnmap"));
+        assert!(!mappings[1].should_dump);
+        assert_eq!(mappings[1].exclusion_reason, Some("device_io_or_pfnmap"));
+        assert!(
+            mappings[2].should_dump,
+            "MADV_DONTDUMP must remain captured"
+        );
+        assert!(!mappings[2].vm_flags_disallow_pagemap_skip);
         assert!(mappings[3].should_dump);
+        assert!(
+            mappings[3].vm_flags_disallow_pagemap_skip,
+            "VM_HUGETLB must disallow 4KiB pagemap skip"
+        );
     }
 
     #[test]

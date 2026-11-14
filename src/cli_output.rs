@@ -150,7 +150,7 @@ pub fn tree(manifest: &Value, output: &Path, elapsed_s: f64, full_ids: bool) -> 
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .chain(c.get("error").into_iter())
+                .chain(c.get("error"))
         })
         .collect();
     let status = field(manifest, "status").to_ascii_uppercase();

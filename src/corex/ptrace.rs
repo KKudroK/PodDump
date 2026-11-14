@@ -58,24 +58,32 @@ impl AttachedThreads {
                     let rc = unsafe { libc::ptrace(libc::PTRACE_SEIZE, tid, 0, 0) };
                     if rc < 0 {
                         let e = io::Error::last_os_error();
-                        if e.raw_os_error() == Some(libc::ESRCH) {
+                        if e.raw_os_error() == Some(libc::ESRCH) && tid != pid {
                             continue;
                         }
                         return Err(CorexError::Ptrace(format!("seize TID {tid}: {e}")));
                     }
                     guard.tids.push(tid);
                     if unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, tid, 0, 0) } < 0 {
-                        return Err(CorexError::Ptrace(format!(
-                            "interrupt TID {tid}: {}",
-                            io::Error::last_os_error()
-                        )));
+                        let e = io::Error::last_os_error();
+                        if e.raw_os_error() == Some(libc::ESRCH) && tid != pid {
+                            guard.tids.retain(|&t| t != tid);
+                            continue;
+                        }
+                        return Err(CorexError::Ptrace(format!("interrupt TID {tid}: {e}")));
                     }
                 }
                 for tid in guard.tids.clone() {
                     if !guard.stopped.contains(&tid) {
-                        let pending = wait_stopped(tid, cancellation, deadline)?;
-                        guard.pending.insert(tid, pending);
-                        guard.stopped.insert(tid);
+                        match wait_stopped_or_exited(tid, tid != pid, cancellation, deadline)? {
+                            WaitOutcome::Stopped(pending) => {
+                                guard.pending.insert(tid, pending);
+                                guard.stopped.insert(tid);
+                            }
+                            WaitOutcome::Exited => {
+                                guard.tids.retain(|&t| t != tid);
+                            }
+                        }
                     }
                 }
             }
@@ -217,11 +225,31 @@ fn check_cancelled(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitOutcome {
+    Stopped(i32),
+    Exited,
+}
+
 fn wait_stopped(
     tid: i32,
     cancellation: Option<&crate::engine::CancellationToken>,
     deadline: Instant,
 ) -> Result<i32, CorexError> {
+    match wait_stopped_or_exited(tid, false, cancellation, deadline)? {
+        WaitOutcome::Stopped(sig) => Ok(sig),
+        WaitOutcome::Exited => Err(CorexError::Ptrace(format!(
+            "thread {tid} exited unexpectedly"
+        ))),
+    }
+}
+
+fn wait_stopped_or_exited(
+    tid: i32,
+    allow_nonleader_exit: bool,
+    cancellation: Option<&crate::engine::CancellationToken>,
+    deadline: Instant,
+) -> Result<WaitOutcome, CorexError> {
     let mut status = 0;
     loop {
         check_cancelled(cancellation)?;
@@ -239,23 +267,31 @@ fn wait_stopped(
             continue;
         }
         let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(CorexError::Ptrace(format!(
-                "failed to wait for thread {tid}: {error}"
-            )));
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
         }
+        if allow_nonleader_exit && matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ECHILD))
+        {
+            return Ok(WaitOutcome::Exited);
+        }
+        return Err(CorexError::Ptrace(format!(
+            "failed to wait for thread {tid}: {error}"
+        )));
     }
     if !libc::WIFSTOPPED(status) {
+        if allow_nonleader_exit && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status)) {
+            return Ok(WaitOutcome::Exited);
+        }
         return Err(CorexError::Ptrace(format!(
             "thread {tid} did not stop after ptrace attach"
         )));
     }
     let event = status >> 16;
-    Ok(if event == 0 {
+    Ok(WaitOutcome::Stopped(if event == 0 {
         libc::WSTOPSIG(status)
     } else {
         0
-    })
+    }))
 }
 
 fn read_regset(tid: i32, note: usize, expected_size: usize) -> Result<Vec<u8>, CorexError> {
@@ -324,36 +360,6 @@ const fn fp_regset_size() -> usize {
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 compile_error!("Rust corex supports only aarch64 and x86_64");
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn aarch64_register_layouts_match_kernel_uapi() {
-        assert_eq!(gp_regset_size(), 272);
-        assert_eq!(fp_regset_size(), 528);
-    }
-
-    #[test]
-    fn cancellation_stops_corex_work() {
-        let cancellation = crate::engine::CancellationToken::default();
-        cancellation.cancel();
-
-        assert!(matches!(
-            check_cancelled(Some(&cancellation)),
-            Err(CorexError::Cancelled)
-        ));
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn x86_64_register_layouts_match_kernel_uapi() {
-        assert_eq!(gp_regset_size(), 216);
-        assert_eq!(fp_regset_size(), 512);
-    }
-}
-
 #[cfg(target_arch = "x86_64")]
 fn read_xstate(tid: i32) -> Result<Vec<u8>, CorexError> {
     let mut data = vec![0u8; 65536];
@@ -391,4 +397,56 @@ fn read_xstate(tid: i32) -> Result<Vec<u8>, CorexError> {
 #[cfg(not(target_arch = "x86_64"))]
 fn read_xstate(_: i32) -> Result<Vec<u8>, CorexError> {
     Ok(Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_register_layouts_match_kernel_uapi() {
+        assert_eq!(gp_regset_size(), 272);
+        assert_eq!(fp_regset_size(), 528);
+    }
+
+    #[test]
+    fn cancellation_stops_corex_work() {
+        let cancellation = crate::engine::CancellationToken::default();
+        cancellation.cancel();
+
+        assert!(matches!(
+            check_cancelled(Some(&cancellation)),
+            Err(CorexError::Cancelled)
+        ));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_64_register_layouts_match_kernel_uapi() {
+        assert_eq!(gp_regset_size(), 216);
+        assert_eq!(fp_regset_size(), 512);
+    }
+
+    #[test]
+    fn worker_thread_exit_is_tolerated_while_leader_exit_fails() {
+        let dead_tid = i32::MAX;
+        let outcome = wait_stopped_or_exited(
+            dead_tid,
+            true,
+            None,
+            Instant::now() + Duration::from_millis(50),
+        )
+        .unwrap();
+        assert_eq!(outcome, WaitOutcome::Exited);
+        assert!(
+            wait_stopped_or_exited(
+                dead_tid,
+                false,
+                None,
+                Instant::now() + Duration::from_millis(50),
+            )
+            .is_err()
+        );
+    }
 }

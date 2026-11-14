@@ -38,7 +38,10 @@ impl Drop for CreditFile {
             eprintln!("release shared credit ranges: {error}");
         }
         if unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) } != 0 {
-            eprintln!("release shared credit admission lock: {}", std::io::Error::last_os_error());
+            eprintln!(
+                "release shared credit admission lock: {}",
+                std::io::Error::last_os_error()
+            );
         }
     }
 }
@@ -56,10 +59,10 @@ pub fn automatic_path() -> Result<PathBuf, String> {
     use std::os::unix::fs::DirBuilderExt;
     let uid = unsafe { libc::geteuid() };
     let mut candidates = Vec::new();
-    if let Ok(custom) = std::env::var("PODDUMP_RUNTIME_DIR") {
-        if !custom.is_empty() {
-            candidates.push(PathBuf::from(custom));
-        }
+    if let Ok(custom) = std::env::var("PODDUMP_RUNTIME_DIR")
+        && !custom.is_empty()
+    {
+        candidates.push(PathBuf::from(custom));
     }
     for base in ["/run", "/var/run", "/var/tmp"] {
         candidates.push(PathBuf::from(format!("{base}/poddump-{uid}")));
@@ -465,7 +468,7 @@ impl SharedBudget {
         probes: &mut ProbeStats,
         ticket: crate::shared_queue::Ticket,
     ) -> Result<Option<Reservation>, String> {
-        if !try_flock(&f)? {
+        if !try_flock(f)? {
             probes.flock_busy += 1;
             return Ok(None);
         }
@@ -503,7 +506,7 @@ impl SharedBudget {
                 .filter(|x| x.1 > 0)
                 .collect::<Vec<_>>();
             for (at, len) in &locks {
-                lock(&f, *at, *len, libc::F_WRLCK as i16)?;
+                lock(f, *at, *len, libc::F_WRLCK as i16)?;
             }
             let admitted_ns = crate::now();
             crate::shared_queue::depart(f, ticket)?;
@@ -550,7 +553,9 @@ mod tests {
     #[test]
     fn inherited_description_does_not_delay_released_credits_or_queue_liveness() {
         let path = std::env::temp_dir().join(format!(
-            "poddump_inherited_{}_{}", std::process::id(), crate::now()
+            "poddump_inherited_{}_{}",
+            std::process::id(),
+            crate::now()
         ));
         let budget = SharedBudget::new(&path, 1, 512, 1024).unwrap();
         let held = budget.try_acquire(512, 1024).unwrap().unwrap();

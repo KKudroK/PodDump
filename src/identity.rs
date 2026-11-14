@@ -42,8 +42,16 @@ fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+fn is_crio_conmon_helper(cgroup: &str) -> bool {
+    cgroup.split('/').any(|segment| {
+        segment.starts_with("crio-conmon-")
+            || segment.starts_with("libpod-conmon-")
+            || segment == "conmon.scope"
+    })
+}
+
 fn parse_container_segment(segment: &str) -> Option<&str> {
-    if segment.starts_with("crio-conmon-") {
+    if segment.starts_with("crio-conmon-") || segment.starts_with("libpod-conmon-") {
         return None;
     }
     let core = segment.strip_suffix(".scope").unwrap_or(segment);
@@ -57,16 +65,16 @@ fn parse_container_segment(segment: &str) -> Option<&str> {
         "containerd-",
         "libpod-",
     ] {
-        if let Some(id) = core.strip_prefix(prefix) {
-            if is_hex64(id) {
-                return Some(id);
-            }
+        if let Some(id) = core.strip_prefix(prefix)
+            && is_hex64(id)
+        {
+            return Some(id);
         }
     }
-    if let Some((_, tail)) = core.rsplit_once('-') {
-        if is_hex64(tail) {
-            return Some(tail);
-        }
+    if let Some((_, tail)) = core.rsplit_once('-')
+        && is_hex64(tail)
+    {
+        return Some(tail);
     }
     None
 }
@@ -87,10 +95,10 @@ fn extract_container_id(cgroup: &str, uid: &str) -> Result<String, String> {
 
 fn cgroup_search_roots() -> Vec<PathBuf> {
     let mut bases = Vec::new();
-    if let Ok(custom) = std::env::var("PODDUMP_CGROUP_ROOT") {
-        if !custom.is_empty() {
-            bases.push(PathBuf::from(custom));
-        }
+    if let Ok(custom) = std::env::var("PODDUMP_CGROUP_ROOT")
+        && !custom.is_empty()
+    {
+        bases.push(PathBuf::from(custom));
     }
     for candidate in ["/host/sys/fs/cgroup", "/sys/fs/cgroup"] {
         let p = PathBuf::from(candidate);
@@ -221,7 +229,7 @@ pub(crate) fn parse_stat_fields(stat_raw: &[u8]) -> Result<(char, u64), String> 
     let tail = std::str::from_utf8(tail_bytes).map_err(|_| "bad stat tail: non-ascii fields")?;
     let fields: Vec<_> = tail.split_whitespace().collect();
     let state = fields
-        .get(0)
+        .first()
         .and_then(|s| s.chars().next())
         .ok_or("empty state")?;
     let starttime = fields
@@ -232,8 +240,21 @@ pub(crate) fn parse_stat_fields(stat_raw: &[u8]) -> Result<(char, u64), String> 
     Ok((state, starttime))
 }
 
+pub(crate) enum MemberLookup {
+    Member(Identity),
+    RuntimeHelper,
+}
+
 impl Identity {
     pub fn read(pid: i32, uid: &str) -> Result<Self, String> {
+        match Self::read_with(pid, uid, |name| {
+            fs::read(format!("/proc/{pid}/{name}")).map_err(|e| format!("PID {pid} {name}: {e}"))
+        })? {
+            MemberLookup::Member(id) => Ok(id),
+            MemberLookup::RuntimeHelper => Err(format!("PID {pid} is a runtime helper (conmon)")),
+        }
+    }
+    pub(crate) fn read_member(pid: i32, uid: &str) -> Result<MemberLookup, String> {
         Self::read_with(pid, uid, |name| {
             fs::read(format!("/proc/{pid}/{name}")).map_err(|e| format!("PID {pid} {name}: {e}"))
         })
@@ -242,7 +263,7 @@ impl Identity {
         pid: i32,
         uid: &str,
         mut read: impl FnMut(&str) -> Result<Vec<u8>, String>,
-    ) -> Result<Self, String> {
+    ) -> Result<MemberLookup, String> {
         let (_, starttime) = parse_stat_fields(&read("stat")?)?;
         let cg_raw = read("cgroup")?;
         let cg = std::str::from_utf8(&cg_raw).map_err(|_| "non-UTF-8 proc cgroup path")?;
@@ -254,14 +275,17 @@ impl Identity {
         if !member(&cgroup, uid) {
             return Err(format!("PID {pid} no longer belongs to Pod {uid}"));
         }
+        if is_crio_conmon_helper(&cgroup) {
+            return Ok(MemberLookup::RuntimeHelper);
+        }
         let container_id = extract_container_id(&cgroup, uid)?;
-        Ok(Self {
+        Ok(MemberLookup::Member(Self {
             pid,
             starttime,
             cgroup,
             container_id,
             state,
-        })
+        }))
     }
     pub fn verify(&self, uid: &str) -> Result<(), String> {
         let current = Self::read(self.pid, uid)?;
@@ -275,12 +299,12 @@ impl Identity {
     }
 }
 pub fn census(root: &Path, uid: &str) -> Result<(Vec<Identity>, Vec<serde_json::Value>), String> {
-    census_with(root, uid, Identity::read)
+    census_with(root, uid, Identity::read_member)
 }
 fn census_with(
     root: &Path,
     uid: &str,
-    mut read: impl FnMut(i32, &str) -> Result<Identity, String>,
+    mut read: impl FnMut(i32, &str) -> Result<MemberLookup, String>,
 ) -> Result<(Vec<Identity>, Vec<serde_json::Value>), String> {
     let mut todo = vec![root.to_path_buf()];
     let mut ids = BTreeMap::new();
@@ -303,8 +327,12 @@ fn census_with(
                 }
             };
             match read(pid, uid) {
-                Ok(id) => {
+                Ok(MemberLookup::Member(id)) => {
                     ids.insert(pid, id);
+                }
+                Ok(MemberLookup::RuntimeHelper) => {
+                    // CRI-O/libpod conmon monitor processes live inside the Pod slice
+                    // without container payload; skip cleanly instead of polluting errors.
                 }
                 Err(e) => {
                     errors.push(serde_json::json!({"pid":pid,"error":e,"kind":"exited_or_identity_read_failure"}));
@@ -436,13 +464,13 @@ mod tests {
         fs::write(root.join("child/cgroup.procs"), "42\nbad\n0\n-1\n43\n").unwrap();
         let uid = "12345678-1234-1234-1234-123456789abc";
         let (ids, errors) = census_with(&root, uid, |pid, _| {
-            Ok(Identity {
+            Ok(MemberLookup::Member(Identity {
                 pid,
                 starttime: 100,
                 cgroup: format!("/pod{uid}/{}", "a".repeat(64)),
                 container_id: "a".repeat(64),
                 state: 'S',
-            })
+            }))
         })
         .unwrap();
         assert_eq!(
@@ -475,5 +503,36 @@ mod tests {
             assert!(id.verify(&uid).is_err());
             assert!(Identity::read(id.pid, "00000000-0000-0000-0000-000000000000").is_err());
         }
+    }
+
+    #[test]
+    fn crio_conmon_helper_is_filtered_without_census_error() {
+        let root = std::env::temp_dir().join(format!(
+            "poddump_conmon_census_{}_{}",
+            std::process::id(),
+            crate::now()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("cgroup.procs"), "101\n102\n").unwrap();
+        let uid = "12345678-1234-1234-1234-123456789abc";
+        let norm = "12345678_1234_1234_1234_123456789abc";
+        let cid = "a".repeat(64);
+        let (ids, errors) = census_with(&root, uid, |pid, u| {
+            Identity::read_with(pid, u, |name| match name {
+                "stat" => Ok(format!("{pid} (app) S {} 55", vec!["0"; 18].join(" ")).into_bytes()),
+                "cgroup" => Ok(if pid == 101 {
+                    format!("0::/kubepods.slice/kubepods-pod{norm}.slice/crio-conmon-{cid}.scope\n")
+                } else {
+                    format!("0::/kubepods.slice/kubepods-pod{norm}.slice/crio-{cid}.scope\n")
+                }
+                .into_bytes()),
+                _ => unreachable!(),
+            })
+        })
+        .unwrap();
+        assert!(errors.is_empty(), "conmon helper must not record error");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].pid, 102);
+        fs::remove_dir_all(root).unwrap();
     }
 }

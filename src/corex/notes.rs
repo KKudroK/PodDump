@@ -15,10 +15,12 @@ pub(super) fn build(process: &ProcessInfo, threads: &[ThreadState]) -> Result<Ve
         return Err(CorexError::InvalidData("invalid note page size".into()));
     }
     if !process.auxv.is_empty()
-        && (process.auxv.len() % 16 != 0
+        && (!process.auxv.len().is_multiple_of(16)
             || process
                 .auxv
-                .chunks_exact(16)
+                .as_chunks::<16>()
+                .0
+                .iter()
                 .position(|entry| entry[..8] == [0; 8])
                 != Some(process.auxv.len() / 16 - 1))
     {
@@ -263,6 +265,10 @@ mod tests {
                 is_shared: false,
                 is_file_backed: true,
                 should_dump: true,
+                exclusion_reason: None,
+                vm_flags_disallow_pagemap_skip: false,
+                rss_bytes: None,
+                swap_bytes: None,
                 path: "/tmp/worker".into(),
                 raw_path: b"/tmp/worker".to_vec(),
             }],
@@ -284,9 +290,9 @@ mod tests {
         };
         let mut p = process();
         p.auxv = vec![1; 15];
-        assert!(build(&p, &[valid.clone()]).is_err());
+        assert!(build(&p, std::slice::from_ref(&valid)).is_err());
         p.auxv = vec![1; 16];
-        assert!(build(&p, &[valid.clone()]).is_err());
+        assert!(build(&p, std::slice::from_ref(&valid)).is_err());
         let mut thread = valid.clone();
         thread.fp_regs.pop();
         assert!(build(&process(), &[thread]).is_err());
@@ -333,6 +339,10 @@ mod tests {
                 is_shared: false,
                 is_file_backed: true,
                 should_dump: true,
+                exclusion_reason: None,
+                vm_flags_disallow_pagemap_skip: false,
+                rss_bytes: None,
+                swap_bytes: None,
                 path: "/tmp/\u{FFFD}.bin".into(),
                 raw_path: b"/tmp/\x80.bin".to_vec(),
             },
@@ -344,6 +354,10 @@ mod tests {
                 is_shared: false,
                 is_file_backed: true,
                 should_dump: true,
+                exclusion_reason: None,
+                vm_flags_disallow_pagemap_skip: false,
+                rss_bytes: None,
+                swap_bytes: None,
                 path: "/tmp/\u{FFFD}.bin".into(),
                 raw_path: b"/tmp/\x81.bin".to_vec(),
             },

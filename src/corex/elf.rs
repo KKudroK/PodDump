@@ -7,23 +7,52 @@ use std::path::Path;
 
 const ELF_HEADER_SIZE: u64 = 64;
 const PROGRAM_HEADER_SIZE: u64 = 56;
+const ELF_SECTION_HEADER_SIZE: u64 = 64;
+const PN_XNUM: u16 = 0xffff;
 const MEMORY_CHUNK_SIZE: usize = 1024 * 1024;
+const SPARSE_PAGE_BYTES: usize = 4096;
 const PT_LOAD: u32 = 1;
 const PT_NOTE: u32 = 4;
-const MAX_RUNS: usize = 65533;
-// Reserve the bounded header area before attachment. Failed pages may split a VMA.
-pub(super) const HEADER_RESERVE_BYTES: usize = (MAX_RUNS + 1) * 56 + 8192;
-fn checked_phnum(loads: usize) -> Result<u16, CorexError> {
-    loads
-        .checked_add(1)
-        .filter(|n| *n < 0xffff)
-        .and_then(|n| u16::try_from(n).ok())
+const MAX_PHDRS: usize = 524_288;
+const MIN_PHDR_SLACK: usize = 64;
+const MAX_PHDR_SLACK: usize = 1024;
+const PM_NONZERO_BITS: u64 = (1 << 63) | (1 << 62) | (1 << 61);
+
+fn phdr_capacity_for(dumped_mappings: usize) -> Result<usize, CorexError> {
+    let slack = dumped_mappings.clamp(MIN_PHDR_SLACK, MAX_PHDR_SLACK);
+    dumped_mappings
+        .checked_add(1 + slack)
+        .filter(|n| *n <= MAX_PHDRS)
         .ok_or_else(|| {
-            CorexError::InvalidData(
-                "extended ELF program-header counts are unsupported (maximum 65533 captured runs)"
-                    .into(),
-            )
+            CorexError::InvalidData(format!(
+                "ELF program-header count exceeds maximum supported runs ({MAX_PHDRS})"
+            ))
         })
+}
+
+pub(super) fn header_reserve_bytes_for(dumped_mappings: usize) -> usize {
+    let slots =
+        dumped_mappings.saturating_add(1 + dumped_mappings.clamp(MIN_PHDR_SLACK, MAX_PHDR_SLACK));
+    (ELF_HEADER_SIZE as usize)
+        .saturating_add(slots.saturating_mul(PROGRAM_HEADER_SIZE as usize))
+        .saturating_add(ELF_SECTION_HEADER_SIZE as usize)
+        .saturating_add(8192)
+}
+
+fn checked_phnum_fields(loads: usize) -> Result<(u16, Option<u32>), CorexError> {
+    let real = loads
+        .checked_add(1)
+        .filter(|n| *n <= MAX_PHDRS && *n <= u32::MAX as usize)
+        .ok_or_else(|| {
+            CorexError::InvalidData(format!(
+                "ELF program-header count exceeds maximum supported runs ({MAX_PHDRS})"
+            ))
+        })?;
+    if real < PN_XNUM as usize {
+        Ok((real as u16, None))
+    } else {
+        Ok((PN_XNUM, Some(real as u32)))
+    }
 }
 fn validate_mappings(process: &ProcessInfo, mappings: &[&Mapping]) -> Result<(), CorexError> {
     if !process.page_size.is_power_of_two() {
@@ -68,21 +97,28 @@ pub(super) struct Coverage {
     pub excluded_bytes: u64,
     pub excluded_uncommitted_prot_none_bytes: u64,
     pub excluded_kernel_special_bytes: u64,
+    pub excluded_device_or_pfnmap_bytes: u64,
     pub captured_bytes: u64,
     pub failed_bytes: u64,
     pub zero_chunk_bytes: u64,
+    pub pagemap_skipped_bytes: u64,
     pub stop_timeout_reached: bool,
     pub spans: Vec<ReadSpan>,
     pub gaps: Vec<ReadGap>,
 }
 impl Coverage {
+    #[cfg(test)]
     fn reserve() -> Result<Self, CorexError> {
+        Self::reserve_for(256)
+    }
+    pub(super) fn reserve_for(expected_mappings: usize) -> Result<Self, CorexError> {
         let mut v = Self::default();
+        let cap = expected_mappings.clamp(64, 4096);
         v.spans
-            .try_reserve_exact(MAX_RUNS)
+            .try_reserve_exact(cap)
             .map_err(|e| CorexError::InvalidData(format!("reserve captured-run ledger: {e}")))?;
         v.gaps
-            .try_reserve_exact(MAX_RUNS)
+            .try_reserve_exact(cap.min(256))
             .map_err(|e| CorexError::InvalidData(format!("reserve read-error ledger: {e}")))?;
         Ok(v)
     }
@@ -91,13 +127,18 @@ impl Coverage {
         let mut requested = 0u64;
         let mut excl_prot_none = 0u64;
         let mut excl_kernel_special = 0u64;
+        let mut excl_device_or_pfnmap = 0u64;
 
         for m in &process.mappings {
             let bytes = m.end.saturating_sub(m.start);
             total = total.saturating_add(bytes);
             if m.should_dump {
                 requested = requested.saturating_add(bytes);
-            } else if super::procfs::is_kernel_special_unreadable(&m.path) {
+            } else if m.exclusion_reason == Some("device_io_or_pfnmap") {
+                excl_device_or_pfnmap = excl_device_or_pfnmap.saturating_add(bytes);
+            } else if m.exclusion_reason == Some("kernel_special_unreadable")
+                || super::procfs::is_kernel_special_unreadable(&m.path)
+            {
                 excl_kernel_special = excl_kernel_special.saturating_add(bytes);
             } else {
                 excl_prot_none = excl_prot_none.saturating_add(bytes);
@@ -109,6 +150,7 @@ impl Coverage {
         self.excluded_bytes = total.saturating_sub(requested);
         self.excluded_uncommitted_prot_none_bytes = excl_prot_none;
         self.excluded_kernel_special_bytes = excl_kernel_special;
+        self.excluded_device_or_pfnmap_bytes = excl_device_or_pfnmap;
     }
     pub(super) fn unattempted_bytes(&self) -> u64 {
         self.requested_bytes
@@ -129,17 +171,66 @@ impl Coverage {
             "excluded_bytes": self.excluded_bytes,
             "excluded_uncommitted_prot_none_bytes": self.excluded_uncommitted_prot_none_bytes,
             "excluded_kernel_special_bytes": self.excluded_kernel_special_bytes,
+            "excluded_device_or_pfnmap_bytes": self.excluded_device_or_pfnmap_bytes,
             "captured_bytes": self.captured_bytes,
             "failed_bytes": self.failed_bytes,
             "unattempted_bytes": self.unattempted_bytes(),
             "stop_timeout_reached": self.stop_timeout_reached,
             "captured_zero_chunk_bytes": self.zero_chunk_bytes,
+            "pagemap_skipped_bytes": self.pagemap_skipped_bytes,
             "captured_runs": self.spans,
             "read_errors": self.gaps,
             "missing_representation": "missing bytes have no PT_LOAD coverage; file padding is not captured memory",
-            "zero_representation": "sparse holes within PT_LOAD describe successfully read zero bytes only",
-            "ledger_entry_limit_each": MAX_RUNS,
+            "zero_representation": "sparse holes within PT_LOAD describe successfully read or kernel-verified unpopulated zero bytes only",
+            "ledger_entry_limit_each": MAX_PHDRS,
         })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn record_span(
+        &mut self,
+        mi: usize,
+        start: u64,
+        off: u64,
+        flags: u32,
+        len: u64,
+        is_zero: bool,
+        pagemap_skipped: bool,
+    ) -> Result<(), CorexError> {
+        if let Some(last) = self.spans.last_mut()
+            && last.mapping_index == mi
+            && last.end == start
+            && last.file_offset + (last.end - last.start) == off
+        {
+            last.end += len;
+            self.captured_bytes += len;
+            if is_zero {
+                self.zero_chunk_bytes += len;
+            }
+            if pagemap_skipped {
+                self.pagemap_skipped_bytes += len;
+            }
+            return Ok(());
+        }
+        if self.spans.len() >= MAX_PHDRS - 1 {
+            return Err(CorexError::InvalidData(
+                "captured-run ledger/ELF header limit reached".into(),
+            ));
+        }
+        self.spans.push(ReadSpan {
+            start,
+            end: start + len,
+            file_offset: off,
+            flags,
+            mapping_index: mi,
+        });
+        self.captured_bytes += len;
+        if is_zero {
+            self.zero_chunk_bytes += len;
+        }
+        if pagemap_skipped {
+            self.pagemap_skipped_bytes += len;
+        }
+        Ok(())
     }
     fn success(
         &mut self,
@@ -149,36 +240,25 @@ impl Coverage {
         flags: u32,
         data: &[u8],
     ) -> Result<(), CorexError> {
-        if let Some(last) = self.spans.last_mut() {
-            if last.mapping_index == mi
-                && last.end == start
-                && last.file_offset + (last.end - last.start) == off
-            {
-                last.end += data.len() as u64;
-                self.captured_bytes += data.len() as u64;
-                if is_all_zero(data) {
-                    self.zero_chunk_bytes += data.len() as u64;
-                }
-                return Ok(());
-            }
-        }
-        if self.spans.len() == MAX_RUNS {
-            return Err(CorexError::InvalidData(
-                "captured-run ledger/ELF header limit reached".into(),
-            ));
-        }
-        self.spans.push(ReadSpan {
+        self.record_span(
+            mi,
             start,
-            end: start + data.len() as u64,
-            file_offset: off,
+            off,
             flags,
-            mapping_index: mi,
-        });
-        self.captured_bytes += data.len() as u64;
-        if is_all_zero(data) {
-            self.zero_chunk_bytes += data.len() as u64;
-        }
-        Ok(())
+            data.len() as u64,
+            is_all_zero(data),
+            false,
+        )
+    }
+    fn success_pagemap_zero(
+        &mut self,
+        mi: usize,
+        start: u64,
+        off: u64,
+        flags: u32,
+        len: u64,
+    ) -> Result<(), CorexError> {
+        self.record_span(mi, start, off, flags, len, true, true)
     }
     fn gap(
         &mut self,
@@ -188,18 +268,17 @@ impl Coverage {
         errno: Option<i32>,
         kind: &'static str,
     ) -> Result<(), CorexError> {
-        if let Some(last) = self.gaps.last_mut() {
-            if last.mapping_index == mi
-                && last.end == start
-                && last.errno == errno
-                && last.kind == kind
-            {
-                last.end += len;
-                self.failed_bytes += len;
-                return Ok(());
-            }
+        if let Some(last) = self.gaps.last_mut()
+            && last.mapping_index == mi
+            && last.end == start
+            && last.errno == errno
+            && last.kind == kind
+        {
+            last.end += len;
+            self.failed_bytes += len;
+            return Ok(());
         }
-        if self.gaps.len() == MAX_RUNS {
+        if self.gaps.len() >= MAX_PHDRS {
             return Err(CorexError::InvalidData(
                 "read-error ledger limit reached".into(),
             ));
@@ -328,9 +407,9 @@ pub(super) struct IoStats {
     pub coverage: Coverage,
 }
 impl IoStats {
-    pub(super) fn reserved() -> Result<Self, CorexError> {
+    pub(super) fn reserved_for(expected_mappings: usize) -> Result<Self, CorexError> {
         Ok(Self {
-            coverage: Coverage::reserve()?,
+            coverage: Coverage::reserve_for(expected_mappings)?,
             ..Self::default()
         })
     }
@@ -343,6 +422,7 @@ pub(super) struct Snapshot {
     len: usize,
     capacity: usize,
     pub(super) stats: IoStats,
+    pub(super) known_zero_ranges: Vec<(usize, usize)>,
 }
 unsafe impl Send for Snapshot {}
 impl Snapshot {
@@ -350,7 +430,7 @@ impl Snapshot {
         if capacity == 0 || capacity > isize::MAX as usize {
             return Err(CorexError::InvalidData("invalid snapshot capacity".into()));
         }
-        let stats = IoStats::reserved()?;
+        let stats = IoStats::reserved_for(256)?;
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -373,10 +453,24 @@ impl Snapshot {
             len: capacity,
             capacity,
             stats,
+            known_zero_ranges: Vec::new(),
         })
     }
     pub(super) fn bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+    fn record_known_zero(&mut self, start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let end = start + len;
+        if let Some(last) = self.known_zero_ranges.last_mut()
+            && last.1 == start
+        {
+            last.1 = end;
+            return;
+        }
+        self.known_zero_ranges.push((start, end));
     }
 }
 impl Drop for Snapshot {
@@ -386,17 +480,58 @@ impl Drop for Snapshot {
         }
     }
 }
+pub(super) trait CoreSink: Write + Seek {
+    fn write_zero_bytes(&mut self, len: u64) -> std::io::Result<()>;
+}
 pub(super) struct SparseWriter<'a> {
     pub file: &'a mut File,
 }
 impl Write for SparseWriter<'_> {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        if data.len() >= 4096 && is_all_zero(data) {
-            self.file.seek(SeekFrom::Current(data.len() as i64))?;
-            Ok(data.len())
-        } else {
-            self.file.write(data)
+        if data.len() < SPARSE_PAGE_BYTES {
+            return self.file.write(data);
         }
+        let mut pos = 0usize;
+        while pos + SPARSE_PAGE_BYTES <= data.len() {
+            if is_all_zero(&data[pos..pos + SPARSE_PAGE_BYTES]) {
+                let mut hole_end = pos + SPARSE_PAGE_BYTES;
+                while hole_end + SPARSE_PAGE_BYTES <= data.len()
+                    && is_all_zero(&data[hole_end..hole_end + SPARSE_PAGE_BYTES])
+                {
+                    hole_end += SPARSE_PAGE_BYTES;
+                }
+                if let Err(e) = self.file.seek(SeekFrom::Current((hole_end - pos) as i64)) {
+                    return if pos > 0 { Ok(pos) } else { Err(e) };
+                }
+                pos = hole_end;
+            } else {
+                let mut data_end = pos + SPARSE_PAGE_BYTES;
+                while data_end + SPARSE_PAGE_BYTES <= data.len()
+                    && !is_all_zero(&data[data_end..data_end + SPARSE_PAGE_BYTES])
+                {
+                    data_end += SPARSE_PAGE_BYTES;
+                }
+                match self.file.write(&data[pos..data_end]) {
+                    Ok(0) => {
+                        return if pos > 0 { Ok(pos) } else { Ok(0) };
+                    }
+                    Ok(n) => {
+                        pos += n;
+                        if n < data_end - (pos - n) {
+                            return Ok(pos);
+                        }
+                    }
+                    Err(e) => return if pos > 0 { Ok(pos) } else { Err(e) },
+                }
+            }
+        }
+        if pos < data.len() {
+            match self.file.write(&data[pos..]) {
+                Ok(n) => pos += n,
+                Err(e) => return if pos > 0 { Ok(pos) } else { Err(e) },
+            }
+        }
+        Ok(pos)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         let len = self.file.stream_position()?;
@@ -409,16 +544,42 @@ impl Seek for SparseWriter<'_> {
         self.file.seek(pos)
     }
 }
+impl CoreSink for SparseWriter<'_> {
+    fn write_zero_bytes(&mut self, len: u64) -> std::io::Result<()> {
+        self.file.seek(SeekFrom::Current(len as i64)).map(|_| ())
+    }
+}
+impl CoreSink for std::io::Cursor<Vec<u8>> {
+    fn write_zero_bytes(&mut self, len: u64) -> std::io::Result<()> {
+        let pos = self.position() as usize;
+        let target = pos.checked_add(len as usize).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "cursor zero overflow")
+        })?;
+        if self.get_ref().len() < target {
+            self.get_mut().resize(target, 0);
+        }
+        self.set_position(target as u64);
+        Ok(())
+    }
+}
+impl<T: CoreSink + ?Sized> CoreSink for &mut T {
+    fn write_zero_bytes(&mut self, len: u64) -> std::io::Result<()> {
+        (**self).write_zero_bytes(len)
+    }
+}
 struct Layout {
+    phdr_slots: usize,
+    shoff: u64,
     note: u64,
     first: u64,
     end: u64,
 }
 fn layout(process: &ProcessInfo, notes: &[u8]) -> Result<Layout, CorexError> {
     let dumped: Vec<_> = process.mappings.iter().filter(|m| m.should_dump).collect();
-    checked_phnum(dumped.len())?;
+    let phdr_slots = phdr_capacity_for(dumped.len())?;
     validate_mappings(process, &dumped)?;
-    let note = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * (MAX_RUNS as u64 + 1);
+    let shoff = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * (phdr_slots as u64);
+    let note = shoff + ELF_SECTION_HEADER_SIZE;
     let first = align_page(
         note.checked_add(notes.len() as u64)
             .ok_or_else(|| CorexError::InvalidData("ELF note size overflow".into()))?,
@@ -428,12 +589,86 @@ fn layout(process: &ProcessInfo, notes: &[u8]) -> Result<Layout, CorexError> {
         n.checked_add(mapping_size(m)?)
             .ok_or_else(|| CorexError::InvalidData("ELF payload size overflow".into()))
     })?;
-    Ok(Layout { note, first, end })
+    Ok(Layout {
+        phdr_slots,
+        shoff,
+        note,
+        first,
+        end,
+    })
 }
+
+pub(super) fn pagemap_eligible(m: &Mapping, page: u64) -> bool {
+    !m.is_file_backed
+        && !m.is_shared
+        && m.flags != 0
+        && !m.vm_flags_disallow_pagemap_skip
+        && m.rss_bytes.is_some()
+        && m.start.is_multiple_of(page)
+        && m.end.is_multiple_of(page)
+        && (m.path.is_empty()
+            || m.path == "[heap]"
+            || m.path == "[stack]"
+            || m.path.starts_with("[stack:")
+            || m.path.starts_with("[anon:"))
+}
+
+enum PagemapStep {
+    ZeroRun(u64),
+    ReadRun(u64),
+}
+
+fn next_pagemap_step(
+    pagemap: &File,
+    va: u64,
+    end: u64,
+    page: u64,
+    max_read: u64,
+) -> Option<PagemapStep> {
+    if !va.is_multiple_of(page) || va >= end {
+        return None;
+    }
+    let remaining_pages = ((end - va) / page) as usize;
+    if remaining_pages == 0 {
+        return None;
+    }
+    let inspect_pages = remaining_pages.min(2048);
+    let mut raw = vec![0u8; inspect_pages * 8];
+    pagemap
+        .read_exact_at(&mut raw, (va / page).checked_mul(8)?)
+        .ok()?;
+    let first = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let first_zero = (first & PM_NONZERO_BITS) == 0;
+    let mut count = 1usize;
+    for chunk in raw[8..].as_chunks::<8>().0 {
+        let val = u64::from_le_bytes(*chunk);
+        let is_zero = (val & PM_NONZERO_BITS) == 0;
+        if is_zero != first_zero {
+            break;
+        }
+        count += 1;
+        if !first_zero && (count as u64 * page) >= max_read {
+            break;
+        }
+    }
+    let bytes = (count as u64).checked_mul(page)?;
+    Some(if first_zero {
+        PagemapStep::ZeroRun(bytes)
+    } else {
+        PagemapStep::ReadRun(bytes.min(max_read))
+    })
+}
+enum ReadChunk<'a> {
+    Data(&'a [u8]),
+    Zero(u64),
+}
+
 // Retrying a failed large read at the current page distinguishes a bad page
 // from readable pages later in the same VMA. Only successful bytes reach sink.
-fn read_mapping<F: FnMut(u64, &[u8]) -> Result<(), CorexError>>(
+#[allow(clippy::too_many_arguments)]
+fn read_mapping<FSink>(
     memory: &File,
+    pagemap: Option<&File>,
     m: &Mapping,
     mi: usize,
     offset: u64,
@@ -442,13 +677,35 @@ fn read_mapping<F: FnMut(u64, &[u8]) -> Result<(), CorexError>>(
     stats: &mut IoStats,
     cancellation: Option<&crate::engine::CancellationToken>,
     alive: &dyn Fn() -> Result<(), CorexError>,
-    mut sink: F,
-) -> Result<(), CorexError> {
+    mut on_chunk: FSink,
+) -> Result<(), CorexError>
+where
+    FSink: FnMut(u64, ReadChunk<'_>) -> Result<(), CorexError>,
+{
+    let use_pagemap = pagemap.filter(|_| pagemap_eligible(m, page));
     let mut address = m.start;
     while address < m.end {
         check_cancelled(cancellation)?;
         alive()?;
         let mut requested = ((m.end - address) as usize).min(buffer.len());
+        if let Some(pm) = use_pagemap
+            && let Some(step) = next_pagemap_step(pm, address, m.end, page, buffer.len() as u64)
+        {
+            match step {
+                PagemapStep::ZeroRun(skip_len) => {
+                    let off = offset + address - m.start;
+                    stats
+                        .coverage
+                        .success_pagemap_zero(mi, address, off, m.flags, skip_len)?;
+                    on_chunk(off, ReadChunk::Zero(skip_len))?;
+                    address += skip_len;
+                    continue;
+                }
+                PagemapStep::ReadRun(read_len) => {
+                    requested = (read_len as usize).min(requested);
+                }
+            }
+        }
         let mut page_retry = false;
         loop {
             check_cancelled(cancellation)?;
@@ -466,7 +723,7 @@ fn read_mapping<F: FnMut(u64, &[u8]) -> Result<(), CorexError>>(
                     stats
                         .coverage
                         .success(mi, address, off, m.flags, &buffer[..n])?;
-                    sink(off, &buffer[..n])?;
+                    on_chunk(off, ReadChunk::Data(&buffer[..n]))?;
                     stats.read_bytes += n as u64;
                     stats.short_reads += u64::from(n < requested);
                     address += n as u64;
@@ -500,9 +757,21 @@ fn headers(
     notes: &[u8],
     l: &Layout,
     c: &Coverage,
-) -> Result<Vec<u8>, CorexError> {
+) -> Result<(Vec<u8>, Option<[u8; ELF_SECTION_HEADER_SIZE as usize]>), CorexError> {
+    if c.spans.len() + 1 > l.phdr_slots {
+        return Err(CorexError::InvalidData(
+            "captured-run count exceeds reserved ELF header slots".into(),
+        ));
+    }
+    let (e_phnum, ext_phnum) = checked_phnum_fields(c.spans.len())?;
     let mut bytes = Vec::with_capacity(64 + 56 * (c.spans.len() + 1));
-    bytes.extend_from_slice(&elf_header(checked_phnum(c.spans.len())?));
+    let mut ehdr = elf_header(e_phnum);
+    if ext_phnum.is_some() {
+        put_u64(&mut ehdr, 40, l.shoff);
+        put_u16(&mut ehdr, 58, ELF_SECTION_HEADER_SIZE as u16);
+        put_u16(&mut ehdr, 60, 1);
+    }
+    bytes.extend_from_slice(&ehdr);
     bytes.extend_from_slice(&program_header(
         PT_NOTE,
         0,
@@ -523,7 +792,13 @@ fn headers(
             process.page_size,
         ));
     }
-    Ok(bytes)
+    let shdr = ext_phnum.map(|real_phnum| {
+        let mut s = [0_u8; ELF_SECTION_HEADER_SIZE as usize];
+        // ELF64 SHT_NULL section header carrying extended phnum in sh_info (offset 44).
+        put_u32(&mut s, 44, real_phnum);
+        s
+    });
+    Ok((bytes, shdr))
 }
 #[cfg(test)]
 pub(super) fn snapshot(
@@ -534,13 +809,15 @@ pub(super) fn snapshot(
     reader: &str,
     alive: &dyn Fn() -> Result<(), CorexError>,
 ) -> Result<Snapshot, CorexError> {
-    snapshot_reserved(process, notes, c, memory, reader, alive, None)
+    snapshot_reserved(process, notes, c, memory, None, reader, alive, None)
 }
+#[allow(clippy::too_many_arguments)]
 pub(super) fn snapshot_reserved(
     process: &ProcessInfo,
     notes: &[u8],
     c: Option<&crate::engine::CancellationToken>,
     memory: &File,
+    pagemap: Option<&File>,
     _reader: &str,
     alive: &dyn Fn() -> Result<(), CorexError>,
     storage: Option<Snapshot>,
@@ -558,11 +835,13 @@ pub(super) fn snapshot_reserved(
         ));
     }
     s.len = len;
+    s.known_zero_ranges.clear();
+    s.stats.coverage = Coverage::reserve_for(process.mappings.len())?;
     s.stats.coverage.init_from_process(process);
     let data = unsafe { std::slice::from_raw_parts_mut(s.ptr, s.len) };
     data[l.note as usize..l.note as usize + notes.len()].copy_from_slice(notes);
     // Read directly into a bounded scratch slice of the reserved snapshot;
-    // successful data is copied only when read_at's destination differs.
+    // unpopulated private-anonymous pages are skipped via pagemap without faulting.
     let mut offset = l.first;
     let result = (|| {
         for (mi, m) in process
@@ -572,13 +851,37 @@ pub(super) fn snapshot_reserved(
             .filter(|(_, m)| m.should_dump)
         {
             let size = mapping_size(m)? as usize;
-            // Use this mapping's own reserved bytes as scratch: failed reads
-            // never acquire a PT_LOAD and no zero is substituted as evidence.
+            let use_pagemap = pagemap.filter(|_| pagemap_eligible(m, process.page_size));
             let mut cursor = 0usize;
             while cursor < size {
                 check_cancelled(c)?;
                 alive()?;
                 let mut n = (size - cursor).min(MEMORY_CHUNK_SIZE);
+                if let Some(pm) = use_pagemap
+                    && let Some(step) = next_pagemap_step(
+                        pm,
+                        m.start + cursor as u64,
+                        m.end,
+                        process.page_size,
+                        MEMORY_CHUNK_SIZE as u64,
+                    )
+                {
+                    match step {
+                        PagemapStep::ZeroRun(skip_len) => {
+                            let at = m.start + cursor as u64;
+                            let file_off = offset + cursor as u64;
+                            s.stats
+                                .coverage
+                                .success_pagemap_zero(mi, at, file_off, m.flags, skip_len)?;
+                            s.record_known_zero(file_off as usize, skip_len as usize);
+                            cursor += skip_len as usize;
+                            continue;
+                        }
+                        PagemapStep::ReadRun(read_len) => {
+                            n = (read_len as usize).min(n);
+                        }
+                    }
+                }
                 let mut retry = false;
                 loop {
                     check_cancelled(c)?;
@@ -639,12 +942,15 @@ pub(super) fn snapshot_reserved(
         }
         Err(e) => return Err(e.with_coverage(s.stats.coverage.json())),
     }
-    let head = headers(process, notes, &l, &s.stats.coverage)?;
+    let (head, shdr) = headers(process, notes, &l, &s.stats.coverage)?;
     data[..head.len()].copy_from_slice(&head);
+    if let Some(shdr) = shdr {
+        data[l.shoff as usize..l.shoff as usize + shdr.len()].copy_from_slice(&shdr);
+    }
     Ok(s)
 }
 #[cfg(test)]
-pub(super) fn write<W: Write + Seek>(
+pub(super) fn write<W: CoreSink>(
     path: &Path,
     output: W,
     process: &ProcessInfo,
@@ -659,19 +965,22 @@ pub(super) fn write<W: Write + Seek>(
         notes,
         c,
         memory,
+        None,
         &|| Ok(()),
         &mut vec![0; MEMORY_CHUNK_SIZE],
         None,
     )
     .map(|_| ())
 }
-pub(super) fn write_reserved<W: Write + Seek>(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn write_reserved<W: CoreSink>(
     path: &Path,
     mut output: W,
     process: &ProcessInfo,
     notes: &[u8],
     c: Option<&crate::engine::CancellationToken>,
     memory: &File,
+    pagemap: Option<&File>,
     alive: &dyn Fn() -> Result<(), CorexError>,
     buffer: &mut [u8],
     stats: Option<IoStats>,
@@ -679,7 +988,7 @@ pub(super) fn write_reserved<W: Write + Seek>(
     let l = layout(process, notes)?;
     let mut stats = match stats {
         Some(s) => s,
-        None => IoStats::reserved()?,
+        None => IoStats::reserved_for(process.mappings.len())?,
     };
     stats.coverage.init_from_process(process);
     assert_eq!(buffer.len(), MEMORY_CHUNK_SIZE);
@@ -700,6 +1009,7 @@ pub(super) fn write_reserved<W: Write + Seek>(
             let mut elapsed = 0u128;
             let read_result = read_mapping(
                 memory,
+                pagemap,
                 m,
                 mi,
                 offset,
@@ -708,12 +1018,18 @@ pub(super) fn write_reserved<W: Write + Seek>(
                 &mut stats,
                 c,
                 alive,
-                |off, bytes| {
+                |off, chunk| {
                     let begin = crate::now();
-                    let result = output
-                        .seek(SeekFrom::Start(off))
-                        .and_then(|_| output.write_all(bytes))
-                        .map_err(|e| CorexError::io("write captured bytes", &display, e));
+                    let result = match chunk {
+                        ReadChunk::Data(bytes) => output
+                            .seek(SeekFrom::Start(off))
+                            .and_then(|_| output.write_all(bytes))
+                            .map_err(|e| CorexError::io("write captured bytes", &display, e)),
+                        ReadChunk::Zero(len) => output
+                            .seek(SeekFrom::Start(off))
+                            .and_then(|_| output.write_zero_bytes(len))
+                            .map_err(|e| CorexError::io("skip zero bytes", &display, e)),
+                    };
                     writes += 1;
                     elapsed += crate::now() - begin;
                     result
@@ -733,11 +1049,17 @@ pub(super) fn write_reserved<W: Write + Seek>(
         }
         Err(e) => return Err(e.with_coverage(stats.coverage.json())),
     }
-    let head = headers(process, notes, &l, &stats.coverage)?;
+    let (head, shdr) = headers(process, notes, &l, &stats.coverage)?;
     output
         .seek(SeekFrom::Start(0))
         .and_then(|_| output.write_all(&head))
-        .and_then(|_| output.seek(SeekFrom::Start(l.end)))
+        .and_then(|_| {
+            if let Some(shdr) = shdr {
+                output.seek(SeekFrom::Start(l.shoff))?;
+                output.write_all(&shdr)?;
+            }
+            output.seek(SeekFrom::Start(l.end))
+        })
         .and_then(|_| output.flush())
         .map_err(|e| CorexError::io("finalize core layout", &display, e))?;
     Ok(stats)
@@ -856,6 +1178,10 @@ mod tests {
                 is_shared: false,
                 is_file_backed: false,
                 should_dump: true,
+                exclusion_reason: None,
+                vm_flags_disallow_pagemap_skip: false,
+                rss_bytes: None,
+                swap_bytes: None,
                 path: String::new(),
                 raw_path: Vec::new(),
             }],
@@ -867,30 +1193,69 @@ mod tests {
     }
 
     #[test]
-    fn reserved_extended_count_is_rejected_by_both_writers() {
-        assert_eq!(checked_phnum(0).unwrap(), 1);
-        assert_eq!(checked_phnum(65533).unwrap(), 65534);
-        assert!(checked_phnum(65534).is_err());
-        assert!(checked_phnum(usize::MAX).is_err());
+    fn extended_program_headers_emit_pn_xnum_in_both_writers() {
+        assert_eq!(checked_phnum_fields(0).unwrap(), (1, None));
+        assert_eq!(checked_phnum_fields(65533).unwrap(), (65534, None));
+        assert_eq!(checked_phnum_fields(65534).unwrap(), (0xffff, Some(65535)));
+        assert!(checked_phnum_fields(usize::MAX).is_err());
+
         let mut process = process();
-        process.mappings = vec![process.mappings[0].clone(); 65534];
-        let memory = File::open("/dev/null").unwrap();
-        let mut output = std::io::Cursor::new(Vec::new());
-        let error = write(
-            Path::new("unused"),
-            &mut output,
+        process.mappings = (0..65534u64)
+            .map(|idx| Mapping {
+                start: 0x10000 + idx * 4096,
+                end: 0x10000 + (idx + 1) * 4096,
+                flags: 4,
+                offset: 0,
+                is_shared: false,
+                is_file_backed: false,
+                should_dump: true,
+                exclusion_reason: None,
+                vm_flags_disallow_pagemap_skip: false,
+                rss_bytes: None,
+                swap_bytes: None,
+                path: String::new(),
+                raw_path: Vec::new(),
+            })
+            .collect();
+        let zero = File::open("/dev/zero").unwrap();
+        let l = layout(&process, &[]).unwrap();
+
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::memfd_create(c"pn_xnum_test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let mut out_file = unsafe { File::from_raw_fd(fd) };
+        let mut scratch = vec![0; MEMORY_CHUNK_SIZE];
+        let stats = write_reserved(
+            Path::new("memfd_pn_xnum"),
+            SparseWriter {
+                file: &mut out_file,
+            },
             &process,
             &[],
             None,
-            &memory,
+            &zero,
+            None,
+            &|| Ok(()),
+            &mut scratch,
+            None,
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("extended ELF program-header"));
-        assert!(output.get_ref().is_empty());
-        match snapshot(&process, &[], None, &memory, "proc_mem", &|| Ok(())) {
-            Err(error) => assert!(error.to_string().contains("extended ELF program-header")),
-            Ok(_) => panic!("reserved PN_XNUM was emitted without section headers"),
-        }
+        .unwrap();
+        assert_eq!(stats.coverage.spans.len(), 65534);
+        let mut ehdr = [0u8; 64];
+        out_file.read_exact_at(&mut ehdr, 0).unwrap();
+        assert_eq!(
+            u16::from_le_bytes(ehdr[56..58].try_into().unwrap()),
+            PN_XNUM
+        );
+        assert_eq!(
+            u64::from_le_bytes(ehdr[40..48].try_into().unwrap()),
+            l.shoff
+        );
+        assert_eq!(u16::from_le_bytes(ehdr[58..60].try_into().unwrap()), 64);
+        assert_eq!(u16::from_le_bytes(ehdr[60..62].try_into().unwrap()), 1);
+        let mut shdr = [0u8; 64];
+        out_file.read_exact_at(&mut shdr, l.shoff).unwrap();
+        assert_eq!(u32::from_le_bytes(shdr[44..48].try_into().unwrap()), 65535);
     }
 
     #[test]
@@ -1089,6 +1454,10 @@ mod maximum_coverage_regressions {
                 is_shared: i == 3,
                 is_file_backed: i == 3,
                 should_dump: true,
+                exclusion_reason: None,
+                vm_flags_disallow_pagemap_skip: false,
+                rss_bytes: Some((length * page) as u64),
+                swap_bytes: Some(0),
                 path: format!("region_{i}"),
                 raw_path: format!("region_{i}").into_bytes(),
             });
@@ -1120,6 +1489,7 @@ mod maximum_coverage_regressions {
             &[],
             None,
             &memory,
+            None,
             &|| Ok(()),
             &mut scratch,
             None,
@@ -1154,6 +1524,7 @@ mod maximum_coverage_regressions {
             b"note-bytes",
             None,
             &mem,
+            None,
             "proc_mem",
             &|| Ok(()),
             None,
@@ -1180,6 +1551,10 @@ mod maximum_coverage_regressions {
                 is_shared: false,
                 is_file_backed: false,
                 should_dump: true,
+                exclusion_reason: None,
+                vm_flags_disallow_pagemap_skip: false,
+                rss_bytes: None,
+                swap_bytes: None,
                 path: "[heap]".into(),
                 raw_path: b"[heap]".to_vec(),
             },
@@ -1191,6 +1566,10 @@ mod maximum_coverage_regressions {
                 is_shared: false,
                 is_file_backed: false,
                 should_dump: false,
+                exclusion_reason: Some("uncommitted_anonymous_prot_none"),
+                vm_flags_disallow_pagemap_skip: false,
+                rss_bytes: Some(0),
+                swap_bytes: Some(0),
                 path: "".into(),
                 raw_path: Vec::new(),
             },
@@ -1202,6 +1581,10 @@ mod maximum_coverage_regressions {
                 is_shared: false,
                 is_file_backed: false,
                 should_dump: false,
+                exclusion_reason: Some("kernel_special_unreadable"),
+                vm_flags_disallow_pagemap_skip: false,
+                rss_bytes: None,
+                swap_bytes: None,
                 path: "[vvar]".into(),
                 raw_path: b"[vvar]".to_vec(),
             },
@@ -1243,6 +1626,7 @@ mod maximum_coverage_regressions {
             &[],
             None,
             &zero,
+            None,
             &|| Err(CorexError::InvalidData("target exited mid-stream".into())),
             &mut scratch,
             None,
@@ -1265,6 +1649,10 @@ mod maximum_coverage_regressions {
                 is_shared: false,
                 is_file_backed: false,
                 should_dump: true,
+                exclusion_reason: None,
+                vm_flags_disallow_pagemap_skip: false,
+                rss_bytes: None,
+                swap_bytes: None,
                 path: "first".into(),
                 raw_path: b"first".to_vec(),
             },
@@ -1276,6 +1664,10 @@ mod maximum_coverage_regressions {
                 is_shared: false,
                 is_file_backed: false,
                 should_dump: true,
+                exclusion_reason: None,
+                vm_flags_disallow_pagemap_skip: false,
+                rss_bytes: None,
+                swap_bytes: None,
                 path: "second".into(),
                 raw_path: b"second".to_vec(),
             },
@@ -1298,6 +1690,7 @@ mod maximum_coverage_regressions {
             b"NOTE",
             Some(&stop_token),
             &zero,
+            None,
             "proc_mem",
             &alive,
             None,
@@ -1331,6 +1724,7 @@ mod maximum_coverage_regressions {
             b"NOTE",
             Some(&stop_stream),
             &zero,
+            None,
             &alive_stream,
             &mut scratch,
             None,
@@ -1346,5 +1740,153 @@ mod maximum_coverage_regressions {
         );
         assert!(read_elf(out.get_ref(), 0x1000).is_some());
         assert!(read_elf(out.get_ref(), 0x2000).is_none());
+    }
+
+    #[test]
+    fn pagemap_read_skip_matches_full_read_byte_for_byte() {
+        let pages = 32usize;
+        let page = 4096usize;
+        let alloc_pattern = || {
+            let base = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    pages * page,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(base, libc::MAP_FAILED);
+            unsafe {
+                libc::madvise(base, pages * page, libc::MADV_NOHUGEPAGE);
+            }
+            let region = Region(base, pages * page);
+            let slice = unsafe { std::slice::from_raw_parts_mut(base.cast::<u8>(), pages * page) };
+            // Fault pages 0, 5..7, 19, 31 with mixed nonzero/zero patterns; leave rest un-faulted demand zero.
+            slice[0..128].fill(0xaa);
+            slice[5 * page..6 * page].fill(0); // Faulted zero page (present=1, all zero!)
+            slice[6 * page..7 * page].fill(0x5a);
+            slice[19 * page + 4090] = 0x7e;
+            slice[31 * page + 10] = 0xff;
+            let mut process = tests::process();
+            process.pid = std::process::id() as i32;
+            process.mappings = vec![Mapping {
+                start: base as u64,
+                end: (base as u64) + (pages * page) as u64,
+                flags: 6,
+                offset: 0,
+                is_shared: false,
+                is_file_backed: false,
+                should_dump: true,
+                exclusion_reason: None,
+                vm_flags_disallow_pagemap_skip: false,
+                rss_bytes: Some((5 * page) as u64),
+                swap_bytes: Some(0),
+                path: String::new(),
+                raw_path: Vec::new(),
+            }];
+            (region, process)
+        };
+
+        let memory = File::open("/proc/self/mem").unwrap();
+        let pagemap = File::open("/proc/self/pagemap").unwrap();
+
+        // Run both Read-Skip passes BEFORE full /proc/self/mem reads so GUP does not pre-fault demand-zero PTEs.
+        let (_region, proc_info) = alloc_pattern();
+        let skipped = snapshot_reserved(
+            &proc_info,
+            b"N",
+            None,
+            &memory,
+            Some(&pagemap),
+            "proc_mem",
+            &|| Ok(()),
+            None,
+        )
+        .unwrap();
+        let mut stream_skip = std::io::Cursor::new(Vec::new());
+        let mut scratch = vec![0u8; MEMORY_CHUNK_SIZE];
+        let stream_skip_stats = write_reserved(
+            Path::new("skip"),
+            &mut stream_skip,
+            &proc_info,
+            b"N",
+            None,
+            &memory,
+            Some(&pagemap),
+            &|| Ok(()),
+            &mut scratch,
+            None,
+        )
+        .unwrap();
+        let full = snapshot_reserved(
+            &proc_info,
+            b"N",
+            None,
+            &memory,
+            None,
+            "proc_mem",
+            &|| Ok(()),
+            None,
+        )
+        .unwrap();
+        let mut stream_full = std::io::Cursor::new(Vec::new());
+        write_reserved(
+            Path::new("full"),
+            &mut stream_full,
+            &proc_info,
+            b"N",
+            None,
+            &memory,
+            None,
+            &|| Ok(()),
+            &mut scratch,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(skipped.bytes(), full.bytes());
+        assert!(skipped.stats.coverage.pagemap_skipped_bytes >= 26 * page as u64);
+        assert!(stream_skip_stats.coverage.pagemap_skipped_bytes >= 26 * page as u64);
+        assert_eq!(skipped.stats.coverage.captured_bytes, (pages * page) as u64);
+        assert_eq!(skipped.stats.coverage.spans.len(), 1);
+        assert_eq!(
+            serde_json::to_string(&skipped.stats.coverage.spans).unwrap(),
+            serde_json::to_string(&full.stats.coverage.spans).unwrap()
+        );
+        assert!(!skipped.known_zero_ranges.is_empty());
+        assert_eq!(stream_skip.get_ref(), stream_full.get_ref());
+        assert_eq!(stream_skip.get_ref().as_slice(), full.bytes());
+    }
+
+    #[test]
+    fn sparse_writer_handles_4kib_interleaved_pages_and_trailing_hole() {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let fd = unsafe { libc::memfd_create(c"sparse_4k".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let mut out = unsafe { File::from_raw_fd(fd) };
+        let mut payload = vec![0u8; 4096 * 6];
+        payload[0..4096].fill(0x11);
+        // pages 1..2 zero (8 KiB)
+        payload[4096 * 3..4096 * 4].fill(0x22);
+        // pages 4..6 trailing zero hole (8 KiB)
+        {
+            let mut writer = SparseWriter { file: &mut out };
+            writer.write_all(&payload).unwrap();
+            writer.flush().unwrap();
+        }
+        let meta = out.metadata().unwrap();
+        assert_eq!(meta.len(), payload.len() as u64);
+        assert!(
+            meta.blocks() * 512 < meta.len(),
+            "expected 4 KiB sparse holes to allocate fewer disk blocks ({} vs {})",
+            meta.blocks() * 512,
+            meta.len()
+        );
+        let mut actual = vec![0u8; payload.len()];
+        out.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, payload);
     }
 }

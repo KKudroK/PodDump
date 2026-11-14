@@ -149,16 +149,21 @@ fn finalize_core(out: &Path, row: &mut Value, owned_file: Option<File>) {
             file.sync_all().map_err(|e| format!("fsync core: {e}"))?;
             row["details"]["durable_ns"] = json!(now());
         }
-        // Read via the held inode, never a replaceable pathname. The capture
-        // thread has already resumed the target before this durability stage.
+        // Read via the held inode only when streaming mode did not already compute
+        // the digest inline during write. Evict finished core pages from host cache.
         use std::os::fd::AsRawFd;
-        let hash_begin = now();
-        let input = File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))
-            .map_err(|e| format!("open captured inode for digest: {e}"))?;
-        row["details"]["core_sha256"] =
-            json!(build_info::hash_reader(input).map_err(|e| format!("hash captured core: {e}"))?);
-        row["details"]["hash_begin_ns"] = json!(hash_begin);
-        row["details"]["hash_end_ns"] = json!(now());
+        if row["details"]["core_sha256"].is_null() {
+            let hash_begin = now();
+            let input = File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))
+                .map_err(|e| format!("open captured inode for digest: {e}"))?;
+            row["details"]["core_sha256"] = json!(
+                build_info::hash_reader(input).map_err(|e| format!("hash captured core: {e}"))?
+            );
+            row["details"]["hash_mode"] = json!("post_sync_fd_read");
+            row["details"]["hash_begin_ns"] = json!(hash_begin);
+            row["details"]["hash_end_ns"] = json!(now());
+        }
+        let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
         if row["details"]["coverage"]["complete"].as_bool() != Some(false) {
             row["details"]["rename_begin_ns"] = json!(now());
             safe_output::publish_file(&partial, &final_path, &file)
@@ -227,7 +232,8 @@ fn empty_census_error(errors: &[serde_json::Value]) -> String {
         "Pod cgroup has no live processes".into()
     } else {
         serde_json::json!({"stage":"initial_census", "error":"no_verified_process_identities",
-                           "census_errors":errors}).to_string()
+                           "census_errors":errors})
+        .to_string()
     }
 }
 
@@ -248,13 +254,13 @@ fn run() -> Result<i32, String> {
         #[cfg(not(feature = "development-options"))]
         {
             println!(
-                "PodDump {}\nUsage: poddump --pod FULL_POD_UID --output NEW_DIR [--request-id ID] [--wait-timeout-ms 0..3600000]\n\nAttempts every mapped memory range for one local Pod UID, including the sandbox; unread bytes are explicit gaps.\nRead/write parallelism, shared node budgets and durable storage are managed internally.\nEach process is captured independently, not a Pod-atomic snapshot.\nRequires the host Linux proc/cgroup mounts and ptrace access.\nSame-Pod requests wait before discovery (default 60000 ms); identical active request-id returns exit 3 and its output link.\nExit 0 confirms complete capture and durable publication; preserve stderr on failure.\n--version and --build-info report the version and actual executable SHA-256.",
+                "PodDump {}\nUsage: poddump --pod FULL_POD_UID --output NEW_DIR [--request-id ID] [--wait-timeout-ms 0..3600000] [--max-write-mbps 1..10000] [--format tree|json] [--full-ids]\n\nAttempts every mapped memory range for one local Pod UID, including the sandbox; unread bytes are explicit gaps.\nRead/write parallelism, shared node budgets, sparse zero skip, inline digest and durable storage are managed internally.\nEach process is captured independently, not a Pod-atomic snapshot.\nRequires the host Linux proc/cgroup mounts and ptrace access.\nSame-Pod requests wait before discovery (default 60000 ms); identical active request-id returns exit 3 and its output link.\nExit 0 confirms complete capture and durable publication; preserve stderr on failure.\n--version and --build-info report the version and actual executable SHA-256.",
                 env!("CARGO_PKG_VERSION")
             );
         }
         #[cfg(feature = "development-options")]
         println!(
-            "PodDump {} (ProcDump Linux 3.5.3 corex-derived)\nUsage: poddump --pod UUID --output NEW_DIR [OPTIONS]\n\n  --pod UUID                     Full Pod UID on the local node\n  --output NEW_DIR               New output directory\n  --format tree|json             Terminal output (default: tree)\n  --full-ids                     Show full container IDs in the tree\n  --jobs 1..16                   Concurrent process workers (default: 4)\n  --memory-mib N                 Snapshot budget (default: 512)\n  --buffer-mib N                 Per-target buffer ceiling (default: 512)\n  --writers 1..16               Independent writers (default: 2)\n  --sync-jobs 1..16             Independent finalizers (default: 1)\n  --pending-mib N               Pending output credits (default: 1024)\n  --writeback none|hint          Writeback experiment (default: none)\n  --shared-budget FILE          Shared private node-credit file\n  --global-jobs 1..16            Shared capture slots (default: 4)\n  --sync-coordination node|none Node core-fsync coordination (default:node)\n  --global-pending 1..64         Unfinished targets held through durability (default:4)\n  --buffer-policy overlap|latency Snapshot admission policy\n  --stop-timeout-ms 1..60000      Stop cap (default: 5000)\n  --trace-level stages|basic     Stage/syscall diagnostics\n  --request-id ID                Caller correlation label\n  --stream                      Capture while stopped\n  --durability batch|per-process Ready-file grouping (default: batch)\n  --census-rounds 0..8           Additional census rounds (default: 2)\n  --timeout-ms 1..3600000        Capture/write deadline (default: 60000)\n\nCompatibility: --pod-uid is an alias for --pod.\nLocal Linux cgroup v1/v2 host (containerd, CRI-O, Docker); includes sandbox processes.\nEach process is captured independently; this is not a Pod-atomic snapshot.",
+            "PodDump {} (ProcDump Linux 3.5.3 corex-derived)\nUsage: poddump --pod UUID --output NEW_DIR [OPTIONS]\n\n  --pod UUID                     Full Pod UID on the local node\n  --output NEW_DIR               New output directory\n  --format tree|json             Terminal output (default: tree)\n  --full-ids                     Show full container IDs in the tree\n  --max-write-mbps 1..10000      Cap disk write bandwidth per process\n  --jobs 1..16                   Concurrent process workers (default: 4)\n  --memory-mib N                 Snapshot budget (default: 512)\n  --buffer-mib N                 Per-target buffer ceiling (default: 512)\n  --writers 1..16                Independent writers (default: 2)\n  --sync-jobs 1..16              Independent finalizers (default: 1)\n  --pending-mib N                Pending output credits (default: 1024)\n  --writeback none|hint          Writeback policy (default: hint)\n  --shared-budget FILE           Shared private node-credit file\n  --global-jobs 1..16            Shared capture slots (default: 4)\n  --sync-coordination node|none  Node core-fsync coordination (default:node)\n  --global-pending 1..64         Unfinished targets held through durability (default:4)\n  --buffer-policy overlap|latency Snapshot admission policy\n  --stop-timeout-ms 1..60000     Stop cap (default: 5000)\n  --trace-level stages|basic     Stage/syscall diagnostics\n  --request-id ID                Caller correlation label\n  --stream                       Capture while stopped\n  --no-pagemap-skip              Disable stage-1 pagemap demand-zero read skip\n  --durability batch|per-process Ready-file grouping (default: batch)\n  --census-rounds 0..8           Additional census rounds (default: 2)\n  --timeout-ms 1..3600000        Capture/write deadline (default: 60000)\n\nCompatibility: --pod-uid is an alias for --pod.\nLocal Linux cgroup v1/v2 host (containerd, CRI-O, Docker); includes sandbox processes.\nEach process is captured independently; this is not a Pod-atomic snapshot.",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(0);
@@ -283,6 +289,7 @@ fn run() -> Result<i32, String> {
         "--trace-level",
         "--request-id",
         "--wait-timeout-ms",
+        "--max-write-mbps",
     ];
     let mut i = 1;
     let mut keys = std::collections::BTreeSet::new();
@@ -295,6 +302,9 @@ fn run() -> Result<i32, String> {
                 "--output",
                 "--request-id",
                 "--wait-timeout-ms",
+                "--max-write-mbps",
+                "--format",
+                "--full-ids",
             ]
             .contains(&k.as_str())
         {
@@ -303,7 +313,10 @@ fn run() -> Result<i32, String> {
         if !keys.insert(k) {
             return Err(format!("duplicate option: {k}"));
         }
-        if k == "--stream" || k == "--full-ids" {
+        if k == "--stream"
+            || k == "--full-ids"
+            || (cfg!(feature = "development-options") && k == "--no-pagemap-skip")
+        {
             i += 1;
             continue;
         }
@@ -392,11 +405,27 @@ fn run() -> Result<i32, String> {
     if backlog == 0 {
         return Err("pending-mib must be positive".into());
     }
-    let writeback = val("--writeback", "none");
+    let writeback = val("--writeback", "hint");
     if writeback != "none" && writeback != "hint" {
         return Err("writeback must be none or hint".into());
     }
     let hint = writeback == "hint";
+    let max_write_mbps: Option<u64> = {
+        let raw = val("--max-write-mbps", "0");
+        let parsed: u64 = raw.parse().map_err(|_| "invalid max-write-mbps")?;
+        if parsed == 0 {
+            if keys.contains(&String::from("--max-write-mbps")) {
+                return Err("max-write-mbps must be 1..10000".into());
+            }
+            None
+        } else if parsed > 10_000 {
+            return Err("max-write-mbps must be 1..10000".into());
+        } else {
+            Some(parsed)
+        }
+    };
+    let no_pagemap_skip =
+        cfg!(feature = "development-options") && args.iter().any(|s| s == "--no-pagemap-skip");
     let shared_path = if cfg!(feature = "development-options") {
         val("--shared-budget", "")
     } else {
@@ -633,17 +662,17 @@ fn run() -> Result<i32, String> {
                         work.captured.write(&path, &work.token, hint)
                     }));
                     work.lease.release_memory(); // Captured dropped its snapshot, including on error/panic.
-                    if let Some(shared) = work.shared.as_mut() {
-                        if let Err(e) = shared.release_memory() {
-                            work.row["status"] = json!("failed");
-                            work.row["error"] = json!(e);
-                            results
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .push(work.row);
-                            CANCEL.store(true, Ordering::Relaxed);
-                            continue;
-                        }
+                    if let Some(shared) = work.shared.as_mut()
+                        && let Err(e) = shared.release_memory()
+                    {
+                        work.row["status"] = json!("failed");
+                        work.row["error"] = json!(e);
+                        results
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(work.row);
+                        CANCEL.store(true, Ordering::Relaxed);
+                        continue;
                     }
                     match result {
                         Ok(Ok((details, file))) => {
@@ -709,7 +738,9 @@ fn run() -> Result<i32, String> {
                                 id.verify(&uid).map_err(corex::CorexError::InvalidData)?;
                                 let f=OpenOptions::new().create_new(true).write(true).mode(0o600).open(&file).map_err(|e|corex::CorexError::io("create core",file.display().to_string(),e))?;
                                 let stop_token=token.capped(stop_timeout);
-                                let captured=corex::capture(&id,&uid,&file,f,&stop_token,request.estimate,!buffered,&reader,request.estimate)?;
+                                let output_ceiling=backlog.max(request.estimate);
+                                let capture_options=corex::CaptureOptions{allow_pagemap_skip:!no_pagemap_skip,max_write_mbps};
+                                let captured=corex::capture_with_options(&id,&uid,&file,f,&stop_token,request.estimate,!buffered,reader,output_ceiling,capture_options)?;
                                 if let Some(s)=shared.as_mut(){s.release_capture().map_err(corex::CorexError::InvalidData)?;}
                                 Ok((captured,shared))
                             }));
@@ -818,11 +849,18 @@ fn run() -> Result<i32, String> {
     }
     Ok(if success { 0 } else { 2 })
 }
-fn main() {
+fn install_signal_handlers() {
     unsafe {
-        libc::signal(libc::SIGINT, signal as *const () as usize);
-        libc::signal(libc::SIGTERM, signal as *const () as usize);
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = signal as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
     }
+}
+fn main() {
+    install_signal_handlers();
     match run() {
         Ok(code) => std::process::exit(code),
         Err(e) => {
@@ -888,11 +926,42 @@ mod durability_tests {
         finalize_core(&d, &mut row, Some(file));
         assert_eq!(row["status"], "complete");
         assert!(row["details"]["durable_ns"].as_u64().unwrap() > 0);
+        assert_eq!(row["details"]["hash_mode"], "post_sync_fd_read");
         assert_eq!(
             fs::read(d.join("1.core")).unwrap(),
             b"immutable captured bytes"
         );
         assert!(!p.exists());
+        fs::remove_dir_all(d).unwrap();
+    }
+    #[test]
+    fn finalize_core_preserves_inline_sha256_without_reread() {
+        let d = directory();
+        let p = d.join("2.core.partial");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&p)
+            .unwrap();
+        file.write_all(b"inline digest payload").unwrap();
+        let sentinel = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut row = json!({
+            "status":"captured_pending_durability",
+            "partial_file":"2.core.partial",
+            "details":{
+                "durable_ns":null,
+                "core_sha256":sentinel,
+                "hash_mode":"inline_write",
+                "hash_begin_ns":10,
+                "hash_end_ns":20
+            }
+        });
+        finalize_core(&d, &mut row, Some(file));
+        assert_eq!(row["status"], "complete");
+        assert_eq!(row["details"]["core_sha256"], sentinel);
+        assert_eq!(row["details"]["hash_mode"], "inline_write");
+        assert!(d.join("2.core").is_file());
         fs::remove_dir_all(d).unwrap();
     }
     #[test]
@@ -1114,15 +1183,37 @@ mod coverage_publication_regressions {
 
     #[test]
     fn failed_capture_cleanup_reports_replaced_file_without_removing_it() {
-        let d = std::env::temp_dir().join(format!("poddump_cleanup_{}_{}", std::process::id(), now()));
+        let d =
+            std::env::temp_dir().join(format!("poddump_cleanup_{}_{}", std::process::id(), now()));
         fs::create_dir(&d).unwrap();
         let p = d.join("999999_1.core.partial");
-        let owned = OpenOptions::new().create_new(true).write(true).mode(0o600).open(&p).unwrap();
+        let owned = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&p)
+            .unwrap();
         fs::rename(&p, d.join("owned_saved")).unwrap();
         fs::write(&p, b"unrelated; preserve").unwrap();
-        let id = identity::Identity {pid:999999,starttime:1,cgroup:String::new(),container_id:String::new(),state:'R'};
+        let id = identity::Identity {
+            pid: 999999,
+            starttime: 1,
+            cgroup: String::new(),
+            container_id: String::new(),
+            state: 'R',
+        };
         let token = engine::CancellationToken::with_timeout(1000);
-        let error = match corex::capture(&id,"00000000-0000-0000-0000-000000000000",&p,owned,&token,4096,false,"proc_mem",4096) {
+        let error = match corex::capture(
+            &id,
+            "00000000-0000-0000-0000-000000000000",
+            &p,
+            owned,
+            &token,
+            4096,
+            false,
+            "proc_mem",
+            4096,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("invalid identity unexpectedly captured"),
         };
