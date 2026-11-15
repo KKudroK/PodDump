@@ -423,6 +423,7 @@ pub(super) struct Snapshot {
     ptr: *mut u8,
     len: usize,
     capacity: usize,
+    clean: bool,
     pub(super) stats: IoStats,
     pub(super) known_zero_ranges: Vec<(usize, usize)>,
 }
@@ -454,6 +455,7 @@ impl Snapshot {
             ptr: ptr.cast(),
             len: capacity,
             capacity,
+            clean: true,
             stats,
             known_zero_ranges: Vec::new(),
         })
@@ -886,6 +888,7 @@ pub(super) fn snapshot_reserved(
             "mapping growth exceeds pre-stop snapshot reservation; detached without waiting".into(),
         ));
     }
+    let was_clean = std::mem::replace(&mut s.clean, false);
     s.len = len;
     s.known_zero_ranges.clear();
     s.stats.coverage = Coverage::reserve_for(process.mappings.len())?;
@@ -998,6 +1001,26 @@ pub(super) fn snapshot_reserved(
     data[..head.len()].copy_from_slice(&head);
     if let Some(shdr) = shdr {
         data[l.shoff as usize..l.shoff as usize + shdr.len()].copy_from_slice(&shdr);
+    }
+    if was_clean {
+        let hdr_zero_start = head.len().next_multiple_of(SPARSE_PAGE_BYTES);
+        let raw_zero_end = if shdr.is_some() {
+            l.shoff as usize
+        } else {
+            l.note as usize
+        };
+        let hdr_zero_end = raw_zero_end / SPARSE_PAGE_BYTES * SPARSE_PAGE_BYTES;
+        if hdr_zero_start < hdr_zero_end {
+            if s.known_zero_ranges
+                .first()
+                .is_some_and(|first| first.0 == hdr_zero_end)
+            {
+                s.known_zero_ranges[0].0 = hdr_zero_start;
+            } else {
+                s.known_zero_ranges
+                    .insert(0, (hdr_zero_start, hdr_zero_end));
+            }
+        }
     }
     Ok(s)
 }
@@ -1995,5 +2018,213 @@ mod maximum_coverage_regressions {
             ));
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_registers_unused_header_slack_in_known_zero_ranges() {
+        let page = 4096usize;
+        let pages = 1024usize;
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                pages * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        let _region = Region(base, pages * page);
+        let addr = base as u64;
+        let mut proc_info = tests::process();
+        proc_info.mappings = vec![Mapping {
+            start: addr,
+            end: addr + (pages * page) as u64,
+            flags: 6,
+            offset: 0,
+            is_shared: false,
+            is_file_backed: false,
+            should_dump: true,
+            exclusion_reason: None,
+            vm_flags_disallow_pagemap_skip: true,
+            rss_bytes: Some(0),
+            swap_bytes: Some(0),
+            path: String::new(),
+            raw_path: Vec::new(),
+        }];
+        let l = layout(&proc_info, b"N").unwrap();
+        assert!(l.note > (page * 2) as u64);
+        let memory = File::open("/proc/self/mem").unwrap();
+        let snap = snapshot_reserved(
+            &proc_info,
+            b"N",
+            None,
+            &memory,
+            None,
+            "proc_mem",
+            &|| Ok(()),
+            None,
+        )
+        .unwrap();
+        let (hz_start, hz_end) = snap.known_zero_ranges[0];
+        assert_eq!(hz_start, page);
+        assert!(hz_end <= l.note as usize);
+        assert!(hz_end > hz_start);
+        assert!(snap.bytes()[hz_start..hz_end].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn userfaultfd_missing_vma_is_never_skipped_as_zero_run() {
+        let mut proc_um = tests::process();
+        proc_um.mappings.truncate(1);
+        proc_um.mappings[0].flags = 6;
+        proc_um.mappings[0].is_shared = false;
+        proc_um.mappings[0].is_file_backed = false;
+        proc_um.mappings[0].vm_flags_disallow_pagemap_skip = true;
+        assert!(!pagemap_eligible(&proc_um.mappings[0], proc_um.page_size));
+
+        #[repr(C)]
+        struct UffdioApi {
+            api: u64,
+            features: u64,
+            ioctls: u64,
+        }
+        #[repr(C)]
+        struct UffdioRange {
+            start: u64,
+            len: u64,
+        }
+        #[repr(C)]
+        struct UffdioRegister {
+            range: UffdioRange,
+            mode: u64,
+            ioctls: u64,
+        }
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                libc::close(fds[0]);
+                // Create userfaultfd inside the forked child so ctx->mm binds to the child's mm.
+                let mut uffd = libc::syscall(libc::SYS_userfaultfd, 1) as i32;
+                if uffd < 0 {
+                    uffd = libc::syscall(libc::SYS_userfaultfd, 0) as i32;
+                }
+                if uffd < 0 {
+                    let zero = 0u64.to_le_bytes();
+                    let _ = libc::write(fds[1], zero.as_ptr().cast(), 8);
+                    libc::close(fds[1]);
+                    libc::_exit(0);
+                }
+                let mut api = UffdioApi {
+                    api: 0xaa,
+                    features: 0,
+                    ioctls: 0,
+                };
+                if libc::syscall(
+                    libc::SYS_ioctl,
+                    uffd,
+                    0xc018_aa3f_u32 as libc::c_ulong,
+                    &mut api,
+                ) != 0
+                {
+                    libc::_exit(11);
+                }
+                let addr = libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                if addr == libc::MAP_FAILED {
+                    libc::_exit(12);
+                }
+                let mut reg = UffdioRegister {
+                    range: UffdioRange {
+                        start: addr as u64,
+                        len: 4096,
+                    },
+                    mode: 1,
+                    ioctls: 0,
+                };
+                if libc::syscall(
+                    libc::SYS_ioctl,
+                    uffd,
+                    0xc020_aa00_u32 as libc::c_ulong,
+                    &mut reg,
+                ) != 0
+                {
+                    libc::_exit(13);
+                }
+                let val = (addr as u64).to_le_bytes();
+                if libc::write(fds[1], val.as_ptr().cast(), 8) != 8 {
+                    libc::_exit(14);
+                }
+                libc::close(fds[1]);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        struct ChildGuard {
+            pid: i32,
+        }
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.pid, libc::SIGKILL);
+                    let mut st = 0;
+                    libc::waitpid(self.pid, &mut st, 0);
+                }
+            }
+        }
+        let _guard = ChildGuard { pid };
+        unsafe { libc::close(fds[1]) };
+        let mut buf = [0u8; 8];
+        let mut read_total = 0usize;
+        while read_total < 8 {
+            let n = unsafe {
+                libc::read(
+                    fds[0],
+                    buf[read_total..].as_mut_ptr().cast(),
+                    8 - read_total,
+                )
+            };
+            assert!(n > 0, "child failed setting up userfaultfd");
+            read_total += n as usize;
+        }
+        unsafe { libc::close(fds[0]) };
+        let uaddr = u64::from_le_bytes(buf);
+        if uaddr == 0 {
+            return;
+        }
+        let _attached = crate::corex::ptrace::AttachedThreads::attach_process(pid, None).unwrap();
+        let mut proc_info = crate::corex::procfs::read_process(pid).unwrap();
+        proc_info
+            .mappings
+            .retain(|m| m.start <= uaddr && m.end >= uaddr + 4096);
+        assert_eq!(proc_info.mappings.len(), 1);
+        assert!(proc_info.mappings[0].should_dump);
+        assert!(proc_info.mappings[0].vm_flags_disallow_pagemap_skip);
+        let memory = File::open(format!("/proc/{pid}/mem")).unwrap();
+        let pagemap = File::open(format!("/proc/{pid}/pagemap")).unwrap();
+        let snap = snapshot_reserved(
+            &proc_info,
+            b"N",
+            None,
+            &memory,
+            Some(&pagemap),
+            "proc_mem",
+            &|| Ok(()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(snap.stats.coverage.pagemap_skipped_bytes, 0);
+        assert!(snap.stats.coverage.failed_bytes >= 4096);
     }
 }

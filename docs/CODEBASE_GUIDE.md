@@ -17,16 +17,16 @@ PodDump는 Pod UID로 프로세스를 찾고, 각 프로세스의 메모리와 C
 
 `pagemap`은 가상 페이지의 현재 상태를 알려 주는 Linux 파일입니다. `pagemap_eligible`은 파일과 연결되지 않은 private 익명 메모리만 허용합니다. `smaps`의 RSS와 `VmFlags`도 확인해야 합니다.
 
-- `io`, `pf`, `ht`, `mm`, `sh`, `ui`, `uw`, `up`가 있거나 `VmFlags`를 읽지 못했으면 `pagemap` 읽기 생략을 하지 않습니다.
+- `io`, `pf`, `ht`, `mm`, `sh`, `ms`, `um`, `uw`, `ui`가 있거나 `VmFlags`를 읽지 못했으면 `pagemap` 읽기 생략을 하지 않습니다.
 - present(63), swapped(62), file/shared(61), guard(58), userfaultfd(57) 비트가 모두 0일 때만 미할당 0 페이지로 처리합니다. guard와 userfaultfd의 뜻은 [Linux pagemap 문서](https://www.kernel.org/doc/html/latest/admin-guide/mm/pagemap.html)를 따릅니다.
 - `pagemap`을 열거나 읽지 못하면 `/proc/PID/mem`에서 실제 읽기를 시도합니다. 실패한 범위를 0으로 꾸미지 않습니다.
-- `MADV_DONTDUMP`의 `dd`만으로 수집에서 제외하지 않습니다. `PROT_NONE` 제외는 일반 익명 메모리에서 RSS·Swap이 모두 0이고 특수 매핑이 아닐 때만 적용합니다. 장치 I/O·PFN 매핑과 읽을 수 없는 커널 특수 구간의 제외는 별도 이유로 기록합니다.
+- `MADV_DONTDUMP`의 `dd`만으로 수집에서 제외하지 않습니다. `PROT_NONE` 제외는 공유 매핑이 아닌 일반 익명 메모리에서 RSS·Swap이 모두 0이고 특수 매핑이 아닐 때만 적용합니다. 장치 I/O·PFN 매핑과 읽을 수 없는 커널 특수 구간의 제외는 별도 이유로 기록합니다.
 
 실제로 읽은 0 구간도 Sparse 파일로 저장합니다. AVX2를 지원하는 CPU에서는 이를 사용하고, 지원하지 않으면 일반 비교 코드로 처리합니다.
 
 ## ELF 헤더와 무결성
 
-`PT_LOAD`는 Core에서 읽을 수 있는 메모리 범위와 파일 위치를 나타냅니다. 읽기 실패가 반복되면 한 매핑이 여러 `PT_LOAD`로 나뉩니다. 따라서 헤더는 매핑 개수뿐 아니라 읽기 성공·실패 페이지가 번갈아 나타나는 경우도 포함해 예약합니다. 전체 상한은 `MAX_PHDRS = 524_288`입니다. 예약만 하고 쓰지 않은 부분은 Sparse로 유지합니다.
+`PT_LOAD`는 Core에서 읽을 수 있는 메모리 범위와 파일 위치를 나타냅니다. 읽기 실패가 반복되면 한 매핑이 여러 `PT_LOAD`로 나뉩니다. 따라서 헤더는 매핑 개수뿐 아니라 읽기 성공·실패 페이지가 번갈아 나타나는 경우도 포함해 예약합니다. 전체 상한은 `MAX_PHDRS = 524_288`입니다. 예약만 하고 쓰지 않은 부분은 Sparse로 유지하며, 버퍼 경로에서도 미접촉 익명 `mmap` 헤더 빈 구간을 `known_zero_ranges`에 등록해 불필요한 페이지 폴트와 0-스캔 없이 건너뜁니다.
 
 버퍼 경로는 쓰는 바이트와 0 구간을 순서대로 SHA-256에 넣는 `inline_write`를 사용합니다. streaming 경로는 동기화된 파일을 다시 읽는 `post_sync_fd_read`를 사용합니다. 이 이름과 실제 디스크 SHA-256 일치는 별도로 검사합니다. `--no-pagemap-skip` 자체가 해시 계산 경로를 바꾸는 것은 아닙니다.
 

@@ -55,6 +55,7 @@ pub(super) fn read_process(pid: i32) -> Result<ProcessInfo, CorexError> {
 fn is_anon_prot_none(m: &Mapping) -> bool {
     m.flags == 0
         && !m.is_file_backed
+        && !m.is_shared
         && !matches!(
             m.path.as_str(),
             "[vvar]" | "[vdso]" | "[vsyscall]" | "[vectors]"
@@ -192,7 +193,7 @@ fn apply_smaps_inspection(mappings: &mut [Mapping], smaps: &str) {
                     if matches!(flag, "io" | "pf") {
                         current_device_or_pfn = true;
                         current_disallow_pagemap_skip = true;
-                    } else if matches!(flag, "ht" | "mm" | "sh" | "ui" | "uw" | "up") {
+                    } else if matches!(flag, "ht" | "mm" | "sh" | "ms" | "um" | "uw" | "ui") {
                         // Do NOT treat VM_DONTDUMP ("dd") as an exclusion: anti-forensic
                         // MADV_DONTDUMP regions remain within all_mapped_proc_mem policy.
                         current_disallow_pagemap_skip = true;
@@ -539,15 +540,53 @@ VmFlags: rd wr mr mw me ht\n";
         assert_eq!(mappings[0].raw_path, b"/tmp/test\\012file");
     }
     #[test]
-    fn missing_vmflags_and_hugetlb_prot_none_never_authorize_zero_omission() {
-        for flags in ["", "VmFlags: ht mr mw me\n", "VmFlags: sh mr mw me\n"] {
+    fn missing_vmflags_and_special_prot_none_never_authorize_zero_omission() {
+        for flags in [
+            "",
+            "VmFlags: ht mr mw me\n",
+            "VmFlags: sh mr mw me\n",
+            "VmFlags: ms mr mw me\n",
+            "VmFlags: mr mw me um ac sd\n",
+            "VmFlags: mr mw me uw ac sd\n",
+            "VmFlags: mr mw me ui ac sd\n",
+        ] {
             let mut maps = vec![parse_mapping(b"1000-2000 ---p 00000000 00:00 0").unwrap()];
             apply_smaps_inspection(
                 &mut maps,
                 &format!("1000-2000 ---p 00000000 00:00 0\nRss: 0 kB\nSwap: 0 kB\n{flags}"),
             );
+            assert!(maps[0].should_dump, "flags `{flags}` excluded");
+            assert!(
+                maps[0].vm_flags_disallow_pagemap_skip,
+                "flags `{flags}` allowed pagemap skip"
+            );
+        }
+        let mut shared_maps = vec![parse_mapping(b"1000-2000 ---s 00000000 00:00 0").unwrap()];
+        apply_smaps_inspection(
+            &mut shared_maps,
+            "1000-2000 ---s 00000000 00:00 0\nRss: 0 kB\nSwap: 0 kB\nVmFlags: mr mw me ac sd\n",
+        );
+        assert!(shared_maps[0].should_dump);
+    }
+
+    #[test]
+    fn userfaultfd_rw_vma_disallows_pagemap_skip() {
+        for flags in [
+            "VmFlags: rd wr mr mw me um ac sd\n",
+            "VmFlags: rd wr mr mw me uw ac sd\n",
+            "VmFlags: rd wr mr mw me ui ac sd\n",
+            "VmFlags: rd wr mr mw me ms ac sd\n",
+        ] {
+            let mut maps = vec![parse_mapping(b"1000-2000 rw-p 00000000 00:00 0").unwrap()];
+            apply_smaps_inspection(
+                &mut maps,
+                &format!("1000-2000 rw-p 00000000 00:00 0\nRss: 0 kB\nSwap: 0 kB\n{flags}"),
+            );
             assert!(maps[0].should_dump);
-            assert!(maps[0].vm_flags_disallow_pagemap_skip);
+            assert!(
+                maps[0].vm_flags_disallow_pagemap_skip,
+                "flags `{flags}` allowed pagemap skip"
+            );
         }
     }
 }

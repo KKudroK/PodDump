@@ -30,7 +30,7 @@
 - **프리즈 없는 발견, 프로세스별 짧은 정지**: cgroup 탐색과 OFD 대기는 비정지로 수행하고, 메모리 수집 단계만 프로세스 단위로 `PTRACE_SEIZE` + `PTRACE_INTERRUPT` 정지 후 `/proc/<pid>/mem`·`pagemap` 핸들을 고정하고 즉시 분리한다. Pod 전체의 동시 스냅샷(atomic snapshot)으로 표기하지 않는다.
 - **커버리지 손실 금지 원칙**:
   - `MADV_DONTDUMP`(`dd`) 표시 영역도 포렌식 증거 유실을 막기 위해 `PT_LOAD`에 유지한다.
-  - Stage-1 `pagemap` 미할당 페이지 생략은 `smaps` `VmFlags`에서 장치 I/O(`io`/`pf`), hugetlb(`ht`), 특수 매핑(`mm`/`sh`/`ui`/`uw`/`up`)이 없을 때만 허용하며, 커널 비트 `(1<<63)|(1<<62)|(1<<61)|(1<<58)|(1<<57)`가 모두 0인 경우에만 0-채움으로 처리한다.
+  - Stage-1 `pagemap` 미할당 페이지 생략은 `smaps` `VmFlags`에서 장치 I/O(`io`/`pf`), hugetlb(`ht`), 특수 매핑(`mm`/`sh`/`ms`/`um`/`uw`/`ui`)이 없을 때만 허용하며, 커널 비트 `(1<<63)|(1<<62)|(1<<61)|(1<<58)|(1<<57)`가 모두 0인 경우에만 0-채움으로 처리한다.
   - `PROT_NONE` 영역은 커밋된 RSS와 스왑이 모두 `0`일 때만(`uncommitted_anonymous_prot_none`) 제외하며 제외 바이트를 `manifest.json`에 명시한다.
 - **희소 파일(Sparse) 논리 무결성**: 디스크 블록을 아끼기 위해 0-구간을 `seek`로 건너뛰더라도 ELF 논리 오프셋과 `PT_LOAD` 범위 내 바이트 스트림(0x00 포함)은 온전해야 하며, 인라인 SHA-256과 디스크 파일 SHA-256이 일치해야 한다.
 - **출력 안전성 및 제어 문자 무해화**: 출력 디렉터리는 `O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC`, `0o700` 권한으로 열고, 최종 파일 게시는 `SYS_renameat2(..., RENAME_NOREPLACE)`를 사용한다. 환경변수·인자·복구 바이트는 마스킹하지 않되 터미널 출력 시 제어 문자는 공백 등으로 안전하게 치환한다.
