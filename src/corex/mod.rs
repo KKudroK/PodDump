@@ -495,6 +495,57 @@ impl Captured {
                 }
                 z
             };
+            let mut pending: Option<(usize, usize)> = None;
+            let flush_slice = |mut remaining: &[u8],
+                               hasher: &mut Sha256,
+                               output: &mut File,
+                               rate: &mut crate::rate_limit::RateLimiter,
+                               write_calls: &mut u64,
+                               short_writes: &mut u64,
+                               written_bytes: &mut usize,
+                               write_call_ns: &mut u128|
+             -> Result<(), CorexError> {
+                if remaining.is_empty() {
+                    return Ok(());
+                }
+                hasher.update(remaining);
+                while !remaining.is_empty() {
+                    let begin = if detailed { crate::now() } else { 0 };
+                    let written = output.write(remaining);
+                    *write_calls += 1;
+                    if detailed {
+                        *write_call_ns += crate::now() - begin;
+                    }
+                    match written {
+                        Ok(0) => {
+                            return Err(CorexError::InvalidData(
+                                "zero-length snapshot write".into(),
+                            ));
+                        }
+                        Ok(n) => {
+                            *short_writes += u64::from(n < remaining.len());
+                            *written_bytes += n;
+                            remaining = &remaining[n..];
+                            if !rate.account(n, || cancellation.is_cancelled()) {
+                                return Err(if cancellation.timed_out() {
+                                    CorexError::TimedOut
+                                } else {
+                                    CorexError::Cancelled
+                                });
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => {
+                            return Err(CorexError::io(
+                                "write snapshot",
+                                path.display().to_string(),
+                                e,
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            };
             while offset < total_len {
                 if cancellation.is_cancelled() {
                     return Err(if cancellation.timed_out() {
@@ -530,74 +581,92 @@ impl Captured {
                         hole_end = next_end;
                     }
                     let hole_len = hole_end - offset;
-                    sparse_bytes += hole_len;
-                    self.output
-                        .seek(SeekFrom::Current(hole_len as i64))
-                        .map_err(|e| {
-                            CorexError::io("seek sparse output", path.display().to_string(), e)
-                        })?;
-                    feed_zero_hash(&mut hasher, hole_len);
+                    if hole_len >= elf::MIN_SPARSE_HOLE_BYTES || hole_end == total_len {
+                        if let Some((p_start, p_end)) = pending.take() {
+                            flush_slice(
+                                &bytes[p_start..p_end],
+                                &mut hasher,
+                                &mut self.output,
+                                &mut rate,
+                                &mut write_calls,
+                                &mut short_writes,
+                                &mut written_bytes,
+                                &mut write_call_ns,
+                            )?;
+                        }
+                        sparse_bytes += hole_len;
+                        self.output
+                            .seek(SeekFrom::Current(hole_len as i64))
+                            .map_err(|e| {
+                                CorexError::io("seek sparse output", path.display().to_string(), e)
+                            })?;
+                        feed_zero_hash(&mut hasher, hole_len);
+                    } else {
+                        let (p_start, p_end) = match &mut pending {
+                            Some((s, e)) => {
+                                *e = hole_end;
+                                (*s, *e)
+                            }
+                            None => {
+                                pending = Some((offset, hole_end));
+                                (offset, hole_end)
+                            }
+                        };
+                        if p_end - p_start >= MAX_WRITE_BATCH_BYTES {
+                            let flush_end = p_start + MAX_WRITE_BATCH_BYTES;
+                            flush_slice(
+                                &bytes[p_start..flush_end],
+                                &mut hasher,
+                                &mut self.output,
+                                &mut rate,
+                                &mut write_calls,
+                                &mut short_writes,
+                                &mut written_bytes,
+                                &mut write_call_ns,
+                            )?;
+                            pending = (flush_end < p_end).then_some((flush_end, p_end));
+                        }
+                    }
                     offset = hole_end;
                 } else {
-                    let mut data_end = block_end;
-                    while data_end < total_len && (data_end - offset) < MAX_WRITE_BATCH_BYTES {
-                        let (next_end, next_known) = next_zero_probe(data_end, &mut kz_idx);
-                        if next_end <= data_end || (next_end - offset) > MAX_WRITE_BATCH_BYTES {
-                            break;
+                    let (p_start, p_end) = match &mut pending {
+                        Some((s, e)) => {
+                            *e = block_end;
+                            (*s, *e)
                         }
-                        if is_block_zero(
-                            data_end,
-                            next_end,
-                            next_known,
-                            &mut cached_block,
-                            &mut zero_scan_ns,
-                        ) {
-                            if !next_known {
-                                cached_block = Some((data_end, next_end, true));
-                            }
-                            break;
+                        None => {
+                            pending = Some((offset, block_end));
+                            (offset, block_end)
                         }
-                        data_end = next_end;
+                    };
+                    if p_end - p_start >= MAX_WRITE_BATCH_BYTES {
+                        let flush_end = p_start + MAX_WRITE_BATCH_BYTES;
+                        flush_slice(
+                            &bytes[p_start..flush_end],
+                            &mut hasher,
+                            &mut self.output,
+                            &mut rate,
+                            &mut write_calls,
+                            &mut short_writes,
+                            &mut written_bytes,
+                            &mut write_call_ns,
+                        )?;
+                        pending = (flush_end < p_end).then_some((flush_end, p_end));
                     }
-                    let mut remaining = &bytes[offset..data_end];
-                    hasher.update(remaining);
-                    while !remaining.is_empty() {
-                        let begin = if detailed { crate::now() } else { 0 };
-                        let written = self.output.write(remaining);
-                        write_calls += 1;
-                        if detailed {
-                            write_call_ns += crate::now() - begin;
-                        }
-                        match written {
-                            Ok(0) => {
-                                return Err(CorexError::InvalidData(
-                                    "zero-length snapshot write".into(),
-                                ));
-                            }
-                            Ok(n) => {
-                                short_writes += u64::from(n < remaining.len());
-                                written_bytes += n;
-                                remaining = &remaining[n..];
-                                if !rate.account(n, || cancellation.is_cancelled()) {
-                                    return Err(if cancellation.timed_out() {
-                                        CorexError::TimedOut
-                                    } else {
-                                        CorexError::Cancelled
-                                    });
-                                }
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                            Err(e) => {
-                                return Err(CorexError::io(
-                                    "write snapshot",
-                                    path.display().to_string(),
-                                    e,
-                                ));
-                            }
-                        }
-                    }
-                    offset = data_end;
+                    offset = block_end;
                 }
+            }
+            if let Some((p_start, p_end)) = pending.take() {
+                flush_slice(
+                    &bytes[p_start..p_end],
+                    &mut hasher,
+                    &mut self.output,
+                    &mut rate,
+                    &mut write_calls,
+                    &mut short_writes,
+                    &mut written_bytes,
+                    &mut write_call_ns,
+                )?;
             }
             self.output
                 .set_len(total_len as u64)
@@ -840,7 +909,9 @@ mod deadline_regressions {
         let (details, mut file) = captured.write(&path, &token, false).unwrap();
         assert_eq!(details["core_sha256"], expected_sha);
         assert_eq!(details["hash_mode"], "inline_write");
-        assert!(details["writer_io"]["sparse_bytes"].as_u64().unwrap() >= (7 * page) as u64);
+        // Trailing demand-zero tail (pages 6..10) punches a sparse hole while
+        // sub-64 KiB interior zeros stay coalesced to avoid extent splits.
+        assert!(details["writer_io"]["sparse_bytes"].as_u64().unwrap() >= (4 * page) as u64);
         let meta = file.metadata().unwrap();
         assert_eq!(meta.len(), expected_len);
         assert!(meta.blocks() * 512 < meta.len());
@@ -850,6 +921,182 @@ mod deadline_regressions {
         file.read_to_end(&mut actual).unwrap();
         assert_eq!(format!("{:x}", Sha256::digest(&actual)), expected_sha);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_write_coalesces_4kib_alternating_pages_and_reused_snapshot_zeros() {
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Seek};
+        let page = 4096usize;
+        let total_pages = 512usize; // 2 MiB: first 1 MiB alternating, second 1 MiB demand-zero.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total_pages * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        struct Region(*mut libc::c_void, usize);
+        impl Drop for Region {
+            fn drop(&mut self) {
+                unsafe { libc::munmap(self.0, self.1) };
+            }
+        }
+        let _region = Region(base, total_pages * page);
+        unsafe { libc::madvise(base, total_pages * page, libc::MADV_NOHUGEPAGE) };
+        let mem_slice =
+            unsafe { std::slice::from_raw_parts_mut(base.cast::<u8>(), total_pages * page) };
+        for p in (0..256).step_by(2) {
+            mem_slice[p * page..(p + 1) * page].fill(0xa5);
+        }
+        let make_proc = |rss_pages: usize| ProcessInfo {
+            pid: std::process::id() as i32,
+            ppid: 1,
+            pgrp: 1,
+            sid: 1,
+            uid: 0,
+            gid: 0,
+            page_size: 4096,
+            comm: b"test".to_vec(),
+            cmdline: b"test".to_vec(),
+            auxv: Vec::new(),
+            coredump_filter: 0x33,
+            exe: "/bin/test".into(),
+            tids: vec![std::process::id() as i32],
+            mappings: vec![Mapping {
+                start: base as u64,
+                end: (base as u64) + (total_pages * page) as u64,
+                flags: 6,
+                offset: 0,
+                is_shared: false,
+                is_file_backed: false,
+                should_dump: true,
+                exclusion_reason: None,
+                vm_flags_disallow_pagemap_skip: false,
+                rss_bytes: Some((rss_pages * page) as u64),
+                swap_bytes: Some(0),
+                path: "[heap]".into(),
+                raw_path: b"[heap]".to_vec(),
+            }],
+        };
+        let memory = File::open("/proc/self/mem").unwrap();
+        let pagemap = File::open("/proc/self/pagemap").unwrap();
+        // First capture populates snapshot with 0xa5 on even pages and zeros on odd demand-zero pages.
+        let snap1 = elf::snapshot_reserved(
+            &make_proc(128),
+            b"notes",
+            None,
+            &memory,
+            Some(&pagemap),
+            "proc_mem",
+            &|| Ok(()),
+            None,
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "poddump_coalesce_{}_{}",
+            std::process::id(),
+            crate::now()
+        ));
+        let out = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let expected_sha = format!("{:x}", Sha256::digest(snap1.bytes()));
+        let write_cap = Captured {
+            details: serde_json::json!({"coverage": snap1.stats.coverage.json()}),
+            output: out,
+            snapshot: Some(snap1),
+            max_write_mbps: None,
+        };
+        let token = crate::engine::CancellationToken::with_timeout(10_000);
+        let (details, mut file) = write_cap.write(&path, &token, false).unwrap();
+        // 1 MiB alternating data+zero + small header slack must coalesce into <= 2 write calls, NOT 128+.
+        assert!(
+            details["writer_io"]["write_calls"].as_u64().unwrap() <= 2,
+            "unexpected fragmentation: {}",
+            details["writer_io"]
+        );
+        assert!(details["writer_io"]["sparse_bytes"].as_u64().unwrap() >= (256 * page) as u64);
+        assert_eq!(details["core_sha256"], expected_sha);
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut actual = Vec::new();
+        file.read_to_end(&mut actual).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(&actual)), expected_sha);
+        drop(file);
+        std::fs::remove_file(&path).unwrap();
+
+        // Now explicitly test reused dirty snapshot (!was_clean) with sub-64 KiB pagemap ZeroRun.
+        let snap_pre = elf::snapshot_reserved(
+            &make_proc(128),
+            b"notes",
+            None,
+            &memory,
+            None,
+            "proc_mem",
+            &|| Ok(()),
+            None,
+        )
+        .unwrap();
+        unsafe {
+            assert_eq!(
+                libc::madvise(base.add(4 * page), page, libc::MADV_DONTNEED),
+                0
+            );
+        }
+        // Notice: make_proc still passes &pagemap, and page 4 is now un-faulted ZeroRun(4096)
+        // overlapping previously non-zero bytes (0xa5) in reused `snap_pre`.
+        let snap2 = elf::snapshot_reserved(
+            &make_proc(127),
+            b"notes",
+            None,
+            &memory,
+            Some(&pagemap),
+            "proc_mem",
+            &|| Ok(()),
+            Some(snap_pre),
+        )
+        .unwrap();
+        let path2 = std::env::temp_dir().join(format!(
+            "poddump_reused_{}_{}",
+            std::process::id(),
+            crate::now()
+        ));
+        let out2 = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path2)
+            .unwrap();
+        let payload_off = snap2.stats.coverage.spans[0].file_offset as usize;
+        let cap2 = Captured {
+            details: serde_json::json!({"coverage": snap2.stats.coverage.json()}),
+            output: out2,
+            snapshot: Some(snap2),
+            max_write_mbps: None,
+        };
+        let (details2, mut file2) = cap2.write(&path2, &token, false).unwrap();
+        file2.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut actual2 = Vec::new();
+        file2.read_to_end(&mut actual2).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&actual2)),
+            details2["core_sha256"]
+        );
+        // Verify page 4 inside the dumped mapping is all zero (not stale 0xa5 from snap_pre)!
+        assert!(
+            actual2[payload_off + 4 * page..payload_off + 5 * page]
+                .iter()
+                .all(|&b| b == 0)
+        );
+        drop(file2);
+        std::fs::remove_file(&path2).unwrap();
     }
 
     #[test]

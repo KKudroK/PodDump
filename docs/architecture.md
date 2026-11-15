@@ -92,8 +92,12 @@ operation can still exceed a userspace deadline.
 Buffered capture copies the selected contents into an anonymous mapping that
 holds the final ELF layout. The target is detached before sparse writing and
 file synchronization. Streaming captures read and write while stopped, then
-detach and synchronize. Actual zero bytes may become sparse holes. Read failures
-never become fabricated successful zero data.
+detach and synchronize. Actual zero bytes may become sparse holes; internal
+zero runs shorter than 64 KiB are written sequentially within contiguous data
+batches to prevent filesystem extent fragmentation, while runs of at least
+64 KiB or trailing zero runs become sparse holes. Read failures never become
+fabricated successful zero data. Post-sync streaming hashing uses `SEEK_DATA`
+and `SEEK_HOLE` so sparse zero holes do not require extra disk reads.
 
 Admission reserves memory, output backlog and descriptor credits before stopping
 the target. The mmap is also created before attachment. Credits include queued

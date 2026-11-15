@@ -158,7 +158,8 @@ fn finalize_core(out: &Path, row: &mut Value, owned_file: Option<File>) {
             let input = File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))
                 .map_err(|e| format!("open captured inode for digest: {e}"))?;
             row["details"]["core_sha256"] = json!(
-                build_info::hash_reader(input).map_err(|e| format!("hash captured core: {e}"))?
+                build_info::hash_sparse_file(input)
+                    .map_err(|e| format!("hash captured core: {e}"))?
             );
             row["details"]["hash_mode"] = json!("post_sync_fd_read");
             row["details"]["hash_begin_ns"] = json!(hash_begin);

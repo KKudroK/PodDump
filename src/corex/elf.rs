@@ -11,6 +11,7 @@ const ELF_SECTION_HEADER_SIZE: u64 = 64;
 const PN_XNUM: u16 = 0xffff;
 const MEMORY_CHUNK_SIZE: usize = 1024 * 1024;
 const SPARSE_PAGE_BYTES: usize = 4096;
+pub(super) const MIN_SPARSE_HOLE_BYTES: usize = 64 * 1024;
 const PT_LOAD: u32 = 1;
 const PT_NOTE: u32 = 4;
 const MAX_PHDRS: usize = 524_288;
@@ -507,15 +508,34 @@ impl<'a> SparseWriter<'a> {
             pending_written: 0,
         }
     }
+    fn write_all_counting(&mut self, mut buf: &[u8]) -> std::io::Result<()> {
+        while !buf.is_empty() {
+            match self.file.write(buf) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write whole sparse chunk",
+                    ));
+                }
+                Ok(n) => {
+                    buf = &buf[n..];
+                    self.pending_written += n;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
 }
 impl Write for SparseWriter<'_> {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        if data.len() < SPARSE_PAGE_BYTES {
-            let n = self.file.write(data)?;
-            self.pending_written += n;
-            return Ok(n);
+        if data.len() < MIN_SPARSE_HOLE_BYTES {
+            self.write_all_counting(data)?;
+            return Ok(data.len());
         }
         let mut pos = 0usize;
+        let mut pending_start: Option<usize> = None;
         while pos + SPARSE_PAGE_BYTES <= data.len() {
             if is_all_zero(&data[pos..pos + SPARSE_PAGE_BYTES]) {
                 let mut hole_end = pos + SPARSE_PAGE_BYTES;
@@ -524,42 +544,27 @@ impl Write for SparseWriter<'_> {
                 {
                     hole_end += SPARSE_PAGE_BYTES;
                 }
-                if let Err(e) = self.file.seek(SeekFrom::Current((hole_end - pos) as i64)) {
-                    return if pos > 0 { Ok(pos) } else { Err(e) };
+                if hole_end - pos >= MIN_SPARSE_HOLE_BYTES {
+                    if let Some(start) = pending_start.take() {
+                        self.write_all_counting(&data[start..pos])?;
+                    }
+                    self.file.seek(SeekFrom::Current((hole_end - pos) as i64))?;
+                } else {
+                    pending_start.get_or_insert(pos);
                 }
                 pos = hole_end;
             } else {
-                let mut data_end = pos + SPARSE_PAGE_BYTES;
-                while data_end + SPARSE_PAGE_BYTES <= data.len()
-                    && !is_all_zero(&data[data_end..data_end + SPARSE_PAGE_BYTES])
-                {
-                    data_end += SPARSE_PAGE_BYTES;
-                }
-                match self.file.write(&data[pos..data_end]) {
-                    Ok(0) => {
-                        return if pos > 0 { Ok(pos) } else { Ok(0) };
-                    }
-                    Ok(n) => {
-                        pos += n;
-                        self.pending_written += n;
-                        if n < data_end - (pos - n) {
-                            return Ok(pos);
-                        }
-                    }
-                    Err(e) => return if pos > 0 { Ok(pos) } else { Err(e) },
-                }
+                pending_start.get_or_insert(pos);
+                pos += SPARSE_PAGE_BYTES;
             }
         }
         if pos < data.len() {
-            match self.file.write(&data[pos..]) {
-                Ok(n) => {
-                    pos += n;
-                    self.pending_written += n;
-                }
-                Err(e) => return if pos > 0 { Ok(pos) } else { Err(e) },
-            }
+            pending_start.get_or_insert(pos);
         }
-        Ok(pos)
+        if let Some(start) = pending_start {
+            self.write_all_counting(&data[start..])?;
+        }
+        Ok(data.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
         let len = self.file.stream_position()?;
@@ -589,7 +594,12 @@ impl CoreSink for SparseWriter<'_> {
         Ok(())
     }
     fn write_zero_bytes(&mut self, len: u64) -> std::io::Result<()> {
-        self.file.seek(SeekFrom::Current(len as i64)).map(|_| ())
+        if len >= MIN_SPARSE_HOLE_BYTES as u64 {
+            self.file.seek(SeekFrom::Current(len as i64)).map(|_| ())
+        } else {
+            static ZERO_SLICE: [u8; MIN_SPARSE_HOLE_BYTES] = [0u8; MIN_SPARSE_HOLE_BYTES];
+            self.write_all_counting(&ZERO_SLICE[..len as usize])
+        }
     }
 }
 impl CoreSink for std::io::Cursor<Vec<u8>> {
@@ -928,6 +938,12 @@ pub(super) fn snapshot_reserved(
                             s.stats
                                 .coverage
                                 .success_pagemap_zero(mi, at, file_off, m.flags, skip_len)?;
+                            // If a reused snapshot holds stale bytes in a sub-threshold zero run,
+                            // clear them so coalesced contiguous writes emit exact zeros.
+                            if !was_clean && (skip_len as usize) < MIN_SPARSE_HOLE_BYTES {
+                                data[file_off as usize..file_off as usize + skip_len as usize]
+                                    .fill(0);
+                            }
                             s.record_known_zero(file_off as usize, skip_len as usize);
                             cursor += skip_len as usize;
                             continue;
@@ -1935,33 +1951,40 @@ mod maximum_coverage_regressions {
     }
 
     #[test]
-    fn sparse_writer_handles_4kib_interleaved_pages_and_trailing_hole() {
+    fn sparse_writer_handles_4kib_interleaved_pages_and_64kib_holes() {
         use std::os::fd::FromRawFd;
         use std::os::unix::fs::MetadataExt;
-        let fd = unsafe { libc::memfd_create(c"sparse_4k".as_ptr(), libc::MFD_CLOEXEC) };
+        let fd = unsafe { libc::memfd_create(c"sparse_64k".as_ptr(), libc::MFD_CLOEXEC) };
         assert!(fd >= 0);
         let mut out = unsafe { File::from_raw_fd(fd) };
-        let mut payload = vec![0u8; 4096 * 6];
-        payload[0..4096].fill(0x11);
-        // pages 1..2 zero (8 KiB)
-        payload[4096 * 3..4096 * 4].fill(0x22);
-        // pages 4..6 trailing zero hole (8 KiB)
+        // Combine interleaved sub-64 KiB 4 KiB zero pages (coalesced) with a >= 64 KiB hole.
+        let mut payload = vec![0u8; 4096 * 40];
+        for p in (0..16).step_by(2) {
+            payload[p * 4096..(p + 1) * 4096].fill(0x11 + p as u8);
+        }
+        // pages 16..36 (20 pages = 80 KiB) are all zero -> punched as a sparse hole.
+        payload[36 * 4096..37 * 4096].fill(0x22);
+        // pages 37..40 (12 KiB) trailing zeros at end of chunk.
         {
             let mut writer = SparseWriter::new(&mut out, None);
             writer.write_all(&payload).unwrap();
+            writer.write_zero_bytes(4096).unwrap();
+            writer.write_zero_bytes(128 * 1024).unwrap();
             writer.flush().unwrap();
         }
+        let mut expected = payload;
+        expected.resize(expected.len() + 4096 + 128 * 1024, 0);
         let meta = out.metadata().unwrap();
-        assert_eq!(meta.len(), payload.len() as u64);
+        assert_eq!(meta.len(), expected.len() as u64);
         assert!(
             meta.blocks() * 512 < meta.len(),
-            "expected 4 KiB sparse holes to allocate fewer disk blocks ({} vs {})",
+            "expected >= 64 KiB sparse holes to allocate fewer blocks ({} vs {})",
             meta.blocks() * 512,
             meta.len()
         );
-        let mut actual = vec![0u8; payload.len()];
+        let mut actual = vec![0u8; expected.len()];
         out.read_exact_at(&mut actual, 0).unwrap();
-        assert_eq!(actual, payload);
+        assert_eq!(actual, expected);
     }
     #[test]
     fn streaming_rate_limit_counts_data_but_not_sparse_holes() {
