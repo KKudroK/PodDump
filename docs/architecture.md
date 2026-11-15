@@ -160,9 +160,7 @@ budget and must be assessed with node memory/pressure measurements.
 These bounds limit queued payload, not total node RSS or memory consumption;
 they cannot guarantee absence of OOM under other allocations or workloads.
 
-The production writeback policy is `none`. A development-only `hint` requests asynchronous
-writeback, which may block under pressure and never counts as a durable commit;
-failure is explicit. Finalizers verify the named inode, fsync the original
+The writeback policy is `hint`, which requests asynchronous writeback and never counts as a durable commit; failure is explicit. Finalizers verify the named inode, fsync the original
 description and publish the core. A finalizer receives the first item and an
 immediately ready group under one receiver-lock lifetime; it never reacquires
 that lock while retaining a pending output. There is no fixed-size wave barrier.
@@ -179,8 +177,7 @@ Other applications, kernel background writeback and the collector's separate
 manifest/directory fsync calls are outside this per-core gate. Preventing a
 node-wide dirty-writeback storm has not been demonstrated.
 
-The production finalizer groups up to eight immediately ready items. Development
-tests can force one-item groups; both paths fsync every file. Capture/write deadlines
+The production finalizer groups up to eight immediately ready items and fsyncs every file. Capture/write deadlines
 are cooperative; final persistence attempts finish afterward. SIGINT/SIGTERM
 observed during durability makes the invocation partial, while already captured
 files finish persistence. This does not impose a hard bound on kernel I/O.
@@ -238,7 +235,7 @@ Abbreviated container prefixes expand on collisions. Failed and uncaptured
 identities, census errors and cancellation remain explicit in partial output.
 Host PIDs and sandbox inclusion are identified in the footer.
 
-`--pod-uid` is a compatibility alias for `--pod`. The durable manifest is the
-machine-readable interface. Presentation and capture tuning flags are accepted
-only in an explicit development build; the ordinary CLI requires only the UID
-and destination, with an optional caller request ID.
+The durable manifest is the machine-readable interface. The CLI accepts only
+`--pod` and `--output` (along with `-h`/`--help` and `-V`/`--version`); capture,
+budget, writeback, and durability policies use fixed defaults and internally
+generated request IDs.

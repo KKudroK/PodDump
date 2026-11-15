@@ -159,7 +159,7 @@ pub fn tree(manifest: &Value, output: &Path, elapsed_s: f64, full_ids: bool) -> 
     if abbreviated {
         write!(
             s,
-            "\nContainer IDs abbreviated; full IDs are in the manifest (--full-ids to display)."
+            "\nContainer IDs abbreviated; full IDs are in the manifest."
         )
         .unwrap();
     }

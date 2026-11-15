@@ -238,274 +238,143 @@ fn empty_census_error(errors: &[serde_json::Value]) -> String {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CliAction {
+    Help,
+    Version,
+    Run { uid: String, output: PathBuf },
+}
+
+fn take_arg_value(
+    flag: &str,
+    inline: Option<&str>,
+    next: Option<&String>,
+) -> Result<(String, usize), String> {
+    match inline {
+        Some(value) => {
+            if value.is_empty() {
+                return Err(format!("missing value: {flag}"));
+            }
+            if value.starts_with('-') {
+                return Err(format!("invalid value for {flag}: {value}"));
+            }
+            Ok((value.to_string(), 1))
+        }
+        None => match next {
+            Some(value) if !value.is_empty() && !value.starts_with('-') => Ok((value.clone(), 2)),
+            Some(value) if value.starts_with('-') => {
+                Err(format!("invalid value for {flag}: {value}"))
+            }
+            _ => Err(format!("missing value: {flag}")),
+        },
+    }
+}
+
+fn parse_cli_args(args: &[String]) -> Result<CliAction, String> {
+    if args.len() <= 1 {
+        return Ok(CliAction::Help);
+    }
+    if args.len() == 2 {
+        match args[1].as_str() {
+            "-h" | "--help" => return Ok(CliAction::Help),
+            "-V" | "--version" => return Ok(CliAction::Version),
+            _ => {}
+        }
+    }
+    let mut pod: Option<String> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
+        let (flag, inline) = match arg.split_once('=') {
+            Some((k, v)) => (k, Some(v)),
+            None => (arg.as_str(), None),
+        };
+        match flag {
+            "--pod" => {
+                if pod.is_some() {
+                    return Err("duplicate option: --pod".into());
+                }
+                let (val, step) = take_arg_value("--pod", inline, args.get(i + 1))?;
+                pod = Some(val);
+                i += step;
+            }
+            "--output" => {
+                if output.is_some() {
+                    return Err("duplicate option: --output".into());
+                }
+                let (val, step) = take_arg_value("--output", inline, args.get(i + 1))?;
+                output = Some(PathBuf::from(val));
+                i += step;
+            }
+            _ => return Err(format!("unknown option: {arg}; use --help")),
+        }
+    }
+    let uid = pod.ok_or("--pod is required")?.to_ascii_lowercase();
+    identity::valid_uid(&uid)?;
+    let output = output.ok_or("--output is required")?;
+    Ok(CliAction::Run { uid, output })
+}
+
+fn print_help() {
+    println!(
+        "PodDump {}\nUsage: poddump --pod FULL_POD_UID --output NEW_DIR\n\nCaptures all mapped memory ranges for every container and sandbox process of one local Pod into ELF Core files.\nAll parallelism, node shared budgets, sparse zero-skip, inline SHA-256 and durable publication defaults are managed internally.\nEach process is stopped briefly and captured independently; this is not a Pod-atomic snapshot.\nRequires host Linux proc/cgroup mounts and ptrace access.\nOptions:\n  --pod FULL_POD_UID   Full Pod UID on the local node (required)\n  --output NEW_DIR     New private output directory (required)\n  -h, --help           Show this help and exit\n  -V, --version        Show version and exit\nExit codes: 0 complete, 1 usage/runtime error, 2 partial capture, 3 active duplicate lock.",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 fn run() -> Result<i32, String> {
     let clock_start = clock_pair();
     let total_begin = now();
     let total_timer = Instant::now();
     let args: Vec<String> = std::env::args().collect();
-    if args.len() == 2 && args[1] == "--version" {
-        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-        return Ok(0);
-    }
-    if args.len() == 2 && args[1] == "--build-info" {
-        println!("{}", build_info::current());
-        return Ok(0);
-    }
-    if args.len() == 1 || args.iter().any(|s| s == "--help") {
-        #[cfg(not(feature = "development-options"))]
-        {
-            println!(
-                "PodDump {}\nUsage: poddump --pod FULL_POD_UID --output NEW_DIR [--request-id ID] [--wait-timeout-ms 0..3600000] [--max-write-mbps 1..10000] [--format tree|json] [--full-ids]\n\nAttempts every mapped memory range for one local Pod UID, including the sandbox; unread bytes are explicit gaps.\nRead/write parallelism, shared node budgets, sparse zero skip, inline digest and durable storage are managed internally.\nEach process is captured independently, not a Pod-atomic snapshot.\nRequires the host Linux proc/cgroup mounts and ptrace access.\nSame-Pod requests wait before discovery (default 60000 ms); identical active request-id returns exit 3 and its output link.\nExit 0 confirms complete capture and durable publication; preserve stderr on failure.\n--version and --build-info report the version and actual executable SHA-256.",
-                env!("CARGO_PKG_VERSION")
-            );
+    let (uid, out) = match parse_cli_args(&args)? {
+        CliAction::Help => {
+            print_help();
+            return Ok(0);
         }
-        #[cfg(feature = "development-options")]
-        println!(
-            "PodDump {} (ProcDump Linux 3.5.3 corex-derived)\nUsage: poddump --pod UUID --output NEW_DIR [OPTIONS]\n\n  --pod UUID                     Full Pod UID on the local node\n  --output NEW_DIR               New output directory\n  --format tree|json             Terminal output (default: tree)\n  --full-ids                     Show full container IDs in the tree\n  --max-write-mbps 1..10000      Cap disk write bandwidth per process\n  --jobs 1..16                   Concurrent process workers (default: 4)\n  --memory-mib N                 Snapshot budget (default: 512)\n  --buffer-mib N                 Per-target buffer ceiling (default: 512)\n  --writers 1..16                Independent writers (default: 2)\n  --sync-jobs 1..16              Independent finalizers (default: 1)\n  --pending-mib N                Pending output credits (default: 1024)\n  --writeback none|hint          Writeback policy (default: hint)\n  --shared-budget FILE           Shared private node-credit file\n  --global-jobs 1..16            Shared capture slots (default: 4)\n  --sync-coordination node|none  Node core-fsync coordination (default:node)\n  --global-pending 1..64         Unfinished targets held through durability (default:4)\n  --buffer-policy overlap|latency Snapshot admission policy\n  --stop-timeout-ms 1..60000     Stop cap (default: 5000)\n  --trace-level stages|basic     Stage/syscall diagnostics\n  --request-id ID                Caller correlation label\n  --stream                       Capture while stopped\n  --no-pagemap-skip              Disable stage-1 pagemap demand-zero read skip\n  --durability batch|per-process Ready-file grouping (default: batch)\n  --census-rounds 0..8           Additional census rounds (default: 2)\n  --timeout-ms 1..3600000        Capture/write deadline (default: 60000)\n\nCompatibility: --pod-uid is an alias for --pod.\nLocal Linux cgroup v1/v2 host (containerd, CRI-O, Docker); includes sandbox processes.\nEach process is captured independently; this is not a Pod-atomic snapshot.",
-            env!("CARGO_PKG_VERSION")
-        );
-        return Ok(0);
-    }
-    let valued = [
-        "--pod",
-        "--pod-uid",
-        "--output",
-        "--jobs",
-        "--buffer-mib",
-        "--memory-mib",
-        "--census-rounds",
-        "--timeout-ms",
-        "--durability",
-        "--format",
-        "--writers",
-        "--sync-jobs",
-        "--pending-mib",
-        "--writeback",
-        "--shared-budget",
-        "--global-jobs",
-        "--global-pending",
-        "--sync-coordination",
-        "--stop-timeout-ms",
-        "--buffer-policy",
-        "--trace-level",
-        "--request-id",
-        "--wait-timeout-ms",
-        "--max-write-mbps",
-    ];
-    let mut i = 1;
-    let mut keys = std::collections::BTreeSet::new();
-    while i < args.len() {
-        let k = &args[i];
-        if !cfg!(feature = "development-options")
-            && ![
-                "--pod",
-                "--pod-uid",
-                "--output",
-                "--request-id",
-                "--wait-timeout-ms",
-                "--max-write-mbps",
-                "--format",
-                "--full-ids",
-            ]
-            .contains(&k.as_str())
-        {
-            return Err(format!("unknown option: {k}; use --help"));
+        CliAction::Version => {
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            return Ok(0);
         }
-        if !keys.insert(k) {
-            return Err(format!("duplicate option: {k}"));
-        }
-        if k == "--stream"
-            || k == "--full-ids"
-            || (cfg!(feature = "development-options") && k == "--no-pagemap-skip")
-        {
-            i += 1;
-            continue;
-        }
-        if !valued.contains(&k.as_str()) {
-            return Err(format!("unknown option: {k}"));
-        }
-        if i + 1 >= args.len() || args[i + 1].starts_with("--") {
-            return Err(format!("missing value: {k}"));
-        }
-        i += 2;
-    }
-    let val = |key: &str, default: &str| -> String {
-        args.iter()
-            .position(|x| x == key)
-            .and_then(|i| args.get(i + 1))
-            .cloned()
-            .unwrap_or(default.into())
+        CliAction::Run { uid, output } => (uid, output),
     };
-    if keys.contains(&String::from("--pod")) && keys.contains(&String::from("--pod-uid")) {
-        return Err("use either --pod or --pod-uid, not both".into());
-    }
-    let format = val("--format", "tree");
-    if format != "tree" && format != "json" {
-        return Err("format must be tree or json".into());
-    }
-    let trace_level = val("--trace-level", "stages");
-    if trace_level != "stages" && trace_level != "basic" {
-        return Err("trace-level must be stages or basic".into());
-    }
-    TRACE.store(trace_level == "stages", Ordering::Relaxed);
-    let full_ids = args.iter().any(|s| s == "--full-ids");
-    let uid = val("--pod", &val("--pod-uid", "")).to_ascii_lowercase();
-    identity::valid_uid(&uid)?;
-    let out = PathBuf::from(val("--output", ""));
-    if out.as_os_str().is_empty() {
-        return Err("--output is required".into());
-    }
-    let jobs: usize = val("--jobs", "4").parse().map_err(|_| "invalid jobs")?;
-    if !(1..=16).contains(&jobs) {
-        return Err("jobs must be 1..16".into());
-    }
-    let rounds: usize = val("--census-rounds", "2")
-        .parse()
-        .map_err(|_| "invalid census rounds")?;
-    if rounds > 8 {
-        return Err("census rounds must be 0..8".into());
-    }
-    let timeout: u64 = val("--timeout-ms", "60000")
-        .parse()
-        .map_err(|_| "invalid timeout")?;
-    if timeout == 0 || timeout > 3600000 {
-        return Err("timeout-ms must be 1..3600000".into());
-    }
-    let stop_timeout = val("--stop-timeout-ms", "5000")
-        .parse::<u64>()
-        .map_err(|_| "invalid stop-timeout-ms")?;
-    if stop_timeout == 0 || stop_timeout > 60000 {
-        return Err("stop-timeout-ms must be1..60000".into());
-    }
+    let trace_level = "stages";
+    TRACE.store(true, Ordering::Relaxed);
+    let jobs: usize = 4;
+    let rounds: usize = 2;
+    let timeout: u64 = 60_000;
+    let stop_timeout: u64 = 5_000;
     let reader = "proc_mem";
-    let limit: usize = val("--buffer-mib", "512")
-        .parse()
-        .map_err(|_| "invalid buffer limit")?;
-    let limit = limit.checked_mul(1024 * 1024).ok_or("buffer overflow")?;
-    let aggregate: usize = val("--memory-mib", "512")
-        .parse()
-        .map_err(|_| "invalid aggregate memory limit")?;
-    let aggregate = aggregate
-        .checked_mul(1024 * 1024)
-        .ok_or("aggregate memory overflow")?;
-    let limit = limit.min(aggregate);
-    let writers: usize = val("--writers", "2")
-        .parse()
-        .map_err(|_| "invalid writers")?;
-    let sync_jobs: usize = val("--sync-jobs", "1")
-        .parse()
-        .map_err(|_| "invalid sync-jobs")?;
-    if !(1..=16).contains(&writers) || !(1..=16).contains(&sync_jobs) {
-        return Err("writers/sync-jobs must be1..16".into());
-    }
-    let backlog = val("--pending-mib", "1024")
-        .parse::<usize>()
-        .map_err(|_| "invalid pending-mib")?
-        .checked_mul(pipeline::MIB)
-        .ok_or("pending-mib overflow")?;
-    if backlog == 0 {
-        return Err("pending-mib must be positive".into());
-    }
-    let writeback = val("--writeback", "hint");
-    if writeback != "none" && writeback != "hint" {
-        return Err("writeback must be none or hint".into());
-    }
-    let hint = writeback == "hint";
-    let max_write_mbps: Option<u64> = {
-        let raw = val("--max-write-mbps", "0");
-        let parsed: u64 = raw.parse().map_err(|_| "invalid max-write-mbps")?;
-        if parsed == 0 {
-            if keys.contains(&String::from("--max-write-mbps")) {
-                return Err("max-write-mbps must be 1..10000".into());
-            }
-            None
-        } else if parsed > 10_000 {
-            return Err("max-write-mbps must be 1..10000".into());
-        } else {
-            Some(parsed)
-        }
-    };
-    let no_pagemap_skip =
-        cfg!(feature = "development-options") && args.iter().any(|s| s == "--no-pagemap-skip");
-    let shared_path = if cfg!(feature = "development-options") {
-        val("--shared-budget", "")
-    } else {
-        shared_budget::automatic_path()?
-            .to_string_lossy()
-            .into_owned()
-    };
-    let global_jobs = val("--global-jobs", "4")
-        .parse::<usize>()
-        .map_err(|_| "invalid global-jobs")?;
-    if !(1..=16).contains(&global_jobs) {
-        return Err("global-jobs must be1..16".into());
-    }
-    let global_pending: usize = val("--global-pending", "4")
-        .parse()
-        .map_err(|_| "invalid global-pending")?;
-    if !(1..=64).contains(&global_pending) {
-        return Err("global-pending must be1..64".into());
-    }
+    let limit: usize = 512 * 1024 * 1024;
+    let aggregate: usize = 512 * 1024 * 1024;
+    let writers: usize = 2;
+    let sync_jobs: usize = 1;
+    let backlog: usize = 1024 * pipeline::MIB;
+    let writeback = "hint";
+    let hint = true;
+    let shared_path = shared_budget::automatic_path()?
+        .to_string_lossy()
+        .into_owned();
+    let global_jobs: usize = 4;
+    let global_pending: usize = 4;
     let shared_init_begin = now();
-    let sync_coordination = val("--sync-coordination", "node");
-    if !["node", "none"].contains(&sync_coordination.as_str()) {
-        return Err("sync-coordination must be node|none".into());
-    }
-    let shared = if shared_path.is_empty() {
-        None
-    } else {
-        Some(shared_budget::SharedBudget::new_with_limits(
-            Path::new(&shared_path),
-            global_jobs,
-            aggregate,
-            backlog,
-            global_pending,
-            &engine::CancellationToken::with_timeout(timeout),
-        )?)
-    };
+    let sync_coordination = "node";
+    let shared = shared_budget::SharedBudget::new_with_limits(
+        Path::new(&shared_path),
+        global_jobs,
+        aggregate,
+        backlog,
+        global_pending,
+        &engine::CancellationToken::with_timeout(timeout),
+    )?;
     let shared_init_end = now();
-    let buffer_policy = val(
-        "--buffer-policy",
-        if cfg!(feature = "development-options") {
-            "overlap"
-        } else {
-            "latency"
-        },
-    );
-    if buffer_policy != "overlap" && buffer_policy != "latency" {
-        return Err("buffer-policy must be overlap or latency".into());
-    }
-    // Two in-flight snapshots can overlap only if neither monopolizes the pool.
-    // A large target uses bounded streaming; the stop deadline still applies.
-    let admission_ceiling = if buffer_policy == "overlap" && (jobs > 1 || shared.is_some()) {
-        limit.min(aggregate / 2)
-    } else {
-        limit
-    };
-    let stream = args.iter().any(|s| s == "--stream");
-    let durability = val("--durability", "batch");
-    if durability != "batch" && durability != "per-process" {
-        return Err("invalid durability".into());
-    }
-
-    let request_id = val(
-        "--request-id",
-        &format!("{}-{}", std::process::id(), total_begin),
-    );
-    if request_id.is_empty()
-        || request_id.len() > 128
-        || !request_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_.:".contains(c))
-    {
-        return Err("request-id must contain1..128 ASCII letters/digits or -_.:".into());
-    }
-    let wait_timeout = val("--wait-timeout-ms", "60000")
-        .parse::<u64>()
-        .map_err(|_| "invalid wait-timeout-ms")?;
-    if wait_timeout > 3600000 {
-        return Err("wait-timeout-ms must be 0..3600000".into());
-    }
+    let buffer_policy = "latency";
+    let admission_ceiling = limit;
+    let stream = false;
+    let durability = "batch";
+    let request_id = format!("{}-{}", std::process::id(), total_begin);
+    let wait_timeout: u64 = 60_000;
     let lock_path = shared_budget::automatic_path()?;
     let pod_lease = match pod_lock::acquire(
         lock_path.parent().ok_or("no runtime directory")?,
@@ -625,12 +494,9 @@ fn run() -> Result<i32, String> {
                     for mut work in group {
                         work.row["details"]["finalizer_received_ns"]=json!(now());
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let permit = if sync_coordination == "node" {
-                                shared.as_ref().map(|b| b.acquire_sync()).transpose()
-                            } else { Ok(None) };
-                            match permit {
+                            match shared.acquire_sync() {
                                 Ok(permit) => {
-                                    if let Some(p) = &permit { work.row["details"]["node_sync_admission"] = p.diagnostics(); }
+                                    work.row["details"]["node_sync_admission"] = permit.diagnostics();
                                     finalize_core(&out, &mut work.row, Some(work.file));
                                 }
                                 Err(e) => {
@@ -735,13 +601,20 @@ fn run() -> Result<i32, String> {
                             let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 if token.is_cancelled() { return Err(corex::CorexError::Cancelled); }
                                 if let Some(e)=request.error { return Err(corex::CorexError::InvalidData(e)); }
-                                let mut shared = match &shared { Some(b)=>Some(b.acquire(if buffered{request.estimate}else{0},request.estimate,&token).map_err(corex::CorexError::InvalidData)?),None=>None };
+                                let mut shared = Some(
+                                    shared
+                                        .acquire(
+                                            if buffered { request.estimate } else { 0 },
+                                            request.estimate,
+                                            &token,
+                                        )
+                                        .map_err(corex::CorexError::InvalidData)?,
+                                );
                                 id.verify(&uid).map_err(corex::CorexError::InvalidData)?;
                                 let f=OpenOptions::new().create_new(true).write(true).mode(0o600).open(&file).map_err(|e|corex::CorexError::io("create core",file.display().to_string(),e))?;
                                 let stop_token=token.capped(stop_timeout);
                                 let output_ceiling=backlog.max(request.estimate);
-                                let capture_options=corex::CaptureOptions{allow_pagemap_skip:!no_pagemap_skip,max_write_mbps};
-                                let captured=corex::capture_with_options(&id,&uid,&file,f,&stop_token,request.estimate,!buffered,reader,output_ceiling,capture_options)?;
+                                let captured=corex::capture(&id,&uid,&file,f,&stop_token,request.estimate,!buffered,reader,output_ceiling)?;
                                 if let Some(s)=shared.as_mut(){s.release_capture().map_err(corex::CorexError::InvalidData)?;}
                                 Ok((captured,shared))
                             }));
@@ -818,7 +691,7 @@ fn run() -> Result<i32, String> {
     manifest["request_id"] = json!(request_id);
     manifest["global_pending_limit"] = json!(global_pending);
     manifest["pod_admission"] = pod_lease.diagnostics.clone();
-    manifest["node_sync_coordination"] = json!({"mode":sync_coordination,"core_fsync_limit":if sync_coordination=="node" && shared.is_some(){Some(1)}else{None},"participation":"all callers must use the same shared budget path and support this coordination; older binaries do not participate","cancellation":"final durable attempts may wait beyond capture cancellation, like fsync itself; no target is stopped while waiting"});
+    manifest["node_sync_coordination"] = json!({"mode":sync_coordination,"core_fsync_limit":Some(1),"participation":"all callers must use the same shared budget path and support this coordination; older binaries do not participate","cancellation":"final durable attempts may wait beyond capture cancellation, like fsync itself; no target is stopped while waiting"});
     manifest["clock_correlation"] = json!({"start":clock_start,"end":clock_pair()});
     manifest["scheduling"] = json!({"shared_budget":shared_path,"global_jobs":global_jobs,"buffer_policy":buffer_policy,"admission_ceiling_bytes":admission_ceiling,"stop_timeout_ms":stop_timeout,"trace_level":trace_level,"shared_init_begin_ns":shared_init_begin,"shared_init_end_ns":shared_init_end,"manifest_reserve_begin_ns":reserve_begin,"manifest_reserve_end_ns":reserve_end,"final_pipeline_join_ns":now()});
     if let Err(e) = output_guard.verify_location() {
@@ -837,17 +710,10 @@ fn run() -> Result<i32, String> {
         return Err(e);
     };
     let elapsed_s = timer.elapsed().as_secs_f64();
-    if format == "json" {
-        println!(
-            "{}",
-            json!({"status":manifest["status"],"manifest":requested_out.join("manifest.json"),"elapsed_s":elapsed_s})
-        );
-    } else {
-        println!(
-            "{}",
-            cli_output::tree(&manifest, &requested_out, elapsed_s, full_ids)
-        );
-    }
+    println!(
+        "{}",
+        cli_output::tree(&manifest, &requested_out, elapsed_s, false)
+    );
     Ok(if success { 0 } else { 2 })
 }
 fn install_signal_handlers() {
@@ -1221,5 +1087,157 @@ mod coverage_publication_regressions {
         assert!(error.to_string().contains("remove failed capture"));
         assert_eq!(fs::read(&p).unwrap(), b"unrelated; preserve");
         fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn s(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    #[test]
+    fn accepts_minimal_cli_contract() {
+        let uid = "12345678-1234-1234-1234-123456789abc";
+        assert_eq!(parse_cli_args(&s(&["poddump"])).unwrap(), CliAction::Help);
+        assert_eq!(
+            parse_cli_args(&s(&["poddump", "-h"])).unwrap(),
+            CliAction::Help
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["poddump", "--help"])).unwrap(),
+            CliAction::Help
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["poddump", "-V"])).unwrap(),
+            CliAction::Version
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["poddump", "--version"])).unwrap(),
+            CliAction::Version
+        );
+        assert_eq!(
+            parse_cli_args(&s(&[
+                "poddump",
+                "--pod",
+                uid,
+                "--output",
+                "/evidence/pod_1"
+            ]))
+            .unwrap(),
+            CliAction::Run {
+                uid: uid.to_string(),
+                output: PathBuf::from("/evidence/pod_1"),
+            }
+        );
+        assert_eq!(
+            parse_cli_args(&s(&[
+                "poddump",
+                "--output=/evidence/pod_2",
+                &format!("--pod={}", uid.to_ascii_uppercase())
+            ]))
+            .unwrap(),
+            CliAction::Run {
+                uid: uid.to_string(),
+                output: PathBuf::from("/evidence/pod_2"),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_removed_duplicate_and_flag_like_arguments() {
+        let uid = "12345678-1234-1234-1234-123456789abc";
+        let rejected = [
+            vec!["poddump", "--build-info"],
+            vec!["poddump", "--pod-uid", uid, "--output", "/evidence/a"],
+            vec![
+                "poddump",
+                "--pod",
+                uid,
+                "--output",
+                "/evidence/a",
+                "--max-write-mbps",
+                "100",
+            ],
+            vec![
+                "poddump",
+                "--pod",
+                uid,
+                "--output",
+                "/evidence/a",
+                "--request-id",
+                "req1",
+            ],
+            vec![
+                "poddump",
+                "--pod",
+                uid,
+                "--output",
+                "/evidence/a",
+                "--wait-timeout-ms",
+                "100",
+            ],
+            vec![
+                "poddump",
+                "--pod",
+                uid,
+                "--output",
+                "/evidence/a",
+                "--format",
+                "json",
+            ],
+            vec![
+                "poddump",
+                "--pod",
+                uid,
+                "--output",
+                "/evidence/a",
+                "--full-ids",
+            ],
+            vec![
+                "poddump",
+                "--pod",
+                uid,
+                "--output",
+                "/evidence/a",
+                "--jobs",
+                "2",
+            ],
+            vec![
+                "poddump",
+                "--pod",
+                uid,
+                "--output",
+                "/evidence/a",
+                "--stream",
+            ],
+            vec![
+                "poddump",
+                "--pod",
+                uid,
+                "--pod",
+                uid,
+                "--output",
+                "/evidence/a",
+            ],
+            vec![
+                "poddump",
+                "--pod",
+                uid,
+                "--output",
+                "/evidence/a",
+                "--output",
+                "/evidence/b",
+            ],
+            vec!["poddump", "--pod", uid, "--output", "--help"],
+            vec!["poddump", "--pod=", "--output", "/evidence/a"],
+            vec!["poddump", "--pod", uid],
+            vec!["poddump", "--output", "/evidence/a"],
+        ];
+        for case in rejected {
+            assert!(parse_cli_args(&s(&case)).is_err(), "expected err: {case:?}");
+        }
     }
 }

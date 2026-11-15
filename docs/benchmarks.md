@@ -255,7 +255,7 @@ Detailed raw logs, harnesses, dated reviews, prior comparisons, original receipt
 and archival path/hash inventories are retained outside the distribution source
 tree in the project experiment store. Historical measurements are not substituted
 for the final table. Unit tests remain embedded beside the Rust implementation;
-`cargo test --locked --offline` and the `development-options` variant run them
+`cargo test --locked --offline` runs them
 without the archived benchmark fixtures or a live Pod capture.
 
 ### Concurrency and timing

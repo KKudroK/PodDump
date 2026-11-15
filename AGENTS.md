@@ -5,7 +5,7 @@
 - 사용자용 설명 문서([docs/CODEBASE_GUIDE.md](docs/CODEBASE_GUIDE.md), [README.md](README.md))는 핵심 결론과 구체적 동작부터 쉬운 한국어로 쓰고 비유는 쓰지 않는다. 새 용어는 쉬운 말로 뜻을 먼저 풀어서 설명한다.
 - 독자용 문서 본문에 검토 기준일, 조사 과정, 작성자 설명, 작업 시각, 예약 상태 같은 관리 기록을 넣지 않는다. 중요한 조건과 한계는 해당 기능을 설명하는 자리에 한 번만 적는다.
 - 코드 구조·기능·검증 근거는 [docs/CODEBASE_GUIDE.md](docs/CODEBASE_GUIDE.md) 한 문서에서 유지관리한다.
-- `src/` 모듈, CLI 옵션(`--pod`, `--max-write-mbps`, `development-options` 포함), `manifest.json` Schema 2 필드, 안전 가드 또는 수집 정책을 변경할 때는 **같은 작업 안에서 `docs/CODEBASE_GUIDE.md`도 함께 갱신**한다.
+- `src/` 모듈, CLI 옵션(`--pod`, `--output`), `manifest.json` Schema 2 필드, 안전 가드 또는 수집 정책을 변경할 때는 **같은 작업 안에서 `docs/CODEBASE_GUIDE.md`도 함께 갱신**한다.
 
 ## 브랜치 및 변경 범위 제한
 
@@ -14,15 +14,14 @@
 
 ## 오프라인 검증 게이트 (코드 변경 시 필수)
 
-모든 Rust 코드 변경 뒤에는 오프라인·잠금 모드로 아래 5개 검사를 모두 통과해야 완료로 간주한다.
+모든 Rust 코드 변경 뒤에는 오프라인·잠금 모드로 아래 4개 검사를 모두 통과해야 완료로 간주한다.
 
 1. `cargo fmt --check`
 2. `cargo clippy --offline --locked --all-targets -- -D warnings`
-3. `cargo clippy --offline --locked --all-targets --features development-options -- -D warnings`
-4. `cargo test --offline --locked`
-5. `python3 scripts/build_release.py --check-vendor`
+3. `cargo test --offline --locked`
+4. `python3 scripts/build_release.py --check-vendor`
 
-수집기 성능을 변경한 경우에는 `--no-pagemap-skip` 대조를 포함해 전체 코어 파일 SHA-256 일치, `PT_LOAD` 배치 유지, `MADV_DONTDUMP` 영역 보존, 미커밋 `PROT_NONE` 제외 여부를 함께 검증하고, 검증에 만든 임시 덤프 파일은 확인 직후 삭제한다.
+수집기 성능을 변경한 경우에는 `corex::CaptureOptions`의 `pagemap` 생략/비생략 대조(`corex` 단위 검사 포함)와 전체 코어 파일 SHA-256 일치, `PT_LOAD` 배치 유지, `MADV_DONTDUMP` 영역 보존, 미커밋 `PROT_NONE` 제외 여부를 함께 검증하고, 검증에 만든 임시 덤프 파일은 확인 직후 삭제한다.
 
 ## 핵심 설계 및 안전 불변식
 

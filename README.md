@@ -78,7 +78,7 @@ sudo cat /evidence/pod_001/manifest.json
 | `0` | 정해진 수집 정책에 따라 완료하고 저장을 마침 | `manifest.json`과 Core를 함께 보관합니다. |
 | `2` | 일부만 수집함 | 실패·제외·미수집 범위를 확인합니다. 남은 파일을 버리지 않습니다. |
 | `1` | 인자, 준비, 저장 등의 오류 | 터미널 오류와 남은 파일을 확인합니다. |
-| `3` | 같은 Pod UID와 같은 요청 ID의 작업이 이미 실행 중 | 출력된 기존 경로에서 원래 작업의 완료를 확인합니다. |
+| `3` | 같은 Pod의 같은 작업이 이미 실행 중 | 출력된 기존 경로에서 원래 작업의 완료를 확인합니다. |
 
 ## 옵션
 
@@ -88,19 +88,15 @@ sudo cat /evidence/pod_001/manifest.json
 
 | 옵션 | 사용 방법 |
 |---|---|
-| `--pod FULL_POD_UID` | 필수. 전체 Pod UID. `--pod-uid`도 같은 뜻입니다. |
+| `--pod FULL_POD_UID` | 필수. 전체 Pod UID |
 | `--output NEW_DIR` | 필수. 새 결과 디렉터리 |
-| `--request-id ID` | 요청을 구별할 이름. 실행 중인 같은 요청을 다시 보내면 기존 작업을 안내합니다. 끝난 뒤 같은 ID로 실행하면 새로 수집합니다. |
-| `--wait-timeout-ms 0..3600000` | 같은 Pod의 앞선 작업을 기다리는 시간. 기본 60,000ms. `0`이면 기다리지 않습니다. |
-| `--max-write-mbps 1..10000` | 프로세스별 Core 쓰기 평균 속도 제한. `1`은 초당 1,000,000바이트입니다. 여러 프로세스를 동시에 쓰면 합계는 이 값보다 클 수 있습니다. |
-| `--format tree\|json` | 터미널 결과 형식. 기본은 `tree`입니다. |
-| `--full-ids` | 터미널에 전체 컨테이너 ID를 표시합니다. |
-| `--version`, `--build-info` | 버전 또는 빌드·실행 파일 정보를 확인합니다. |
+| `-h`, `--help` | 사용법 확인 |
+| `-V`, `--version` | 버전 확인 |
 
-쓰기 속도 제한 예시입니다. 실제 쓰기는 묶어서 진행하므로 짧은 순간에는 설정값보다 빠를 수 있습니다. 큰 프로세스를 읽으며 바로 저장하는 경로에도 제한이 적용됩니다. 제한이 낮으면 수집 시간이 늘거나 프로세스 정지 시간 한도에 닿아 `partial`이 될 수 있습니다.
+작업자 수, 대기 시간, 메모리 예산, 0 페이지 생략 같은 내부 동작은 프로그램이 자동으로 정합니다.
 
 ```sh
-sudo ./poddump --pod "$POD_UID" --output /evidence/pod_002   --request-id case_001 --max-write-mbps 200
+sudo ./poddump --pod "$POD_UID" --output /evidence/pod_002
 ```
 
 ## 수집 범위와 주의할 점
@@ -124,7 +120,7 @@ cargo test --offline --locked
 python3 scripts/build_release.py
 ```
 
-결과는 `release/poddump`, `release/manifest.json`, `release/SHA256SUMS.txt`입니다. 공개 빌드에는 `development-options`를 켜지 않습니다.
+결과는 `release/poddump`, `release/manifest.json`, `release/SHA256SUMS.txt`입니다. 공개 빌드에는 추가 테스트 기능이 들어가지 않습니다.
 
 - [코드와 수집 원리](docs/CODEBASE_GUIDE.md)
 - [배포 조건](docs/deployment.md)

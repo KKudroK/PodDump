@@ -105,7 +105,6 @@ pub(crate) struct Captured {
     max_write_mbps: Option<u64>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn capture(
     id: &crate::identity::Identity,
